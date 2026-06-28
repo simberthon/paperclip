@@ -52,6 +52,7 @@ import {
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
+  isClaudeSuccessResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
   isClaudePoisonedPreviousMessageIdError,
@@ -878,7 +879,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
     const poisonedPreviousMessageId = isClaudePoisonedPreviousMessageIdError(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
+    // LUN-2682: a run that emitted a clean terminal success result but was then
+    // SIGTERM'd mid-flush exits non-zero (commonly 143). That is a termination
+    // artifact, not a failure — the agentic work already completed. Classify it
+    // as succeeded so the agent is not stranded in `error` when no follow-up run
+    // ever reschedules it. The real exit code/signal are preserved in
+    // resultJson for observability, and the flag is surfaced to the server so it
+    // can override its own `exitCode === 0` success gate.
+    const succeededAfterTermination =
+      !parsedIsError && (proc.exitCode ?? 0) !== 0 && isClaudeSuccessResult(parsed);
+    const failed = !succeededAfterTermination && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -941,6 +951,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(succeededAfterTermination
+        ? {
+            succeededAfterTermination: true,
+            terminationExitCode: proc.exitCode,
+            terminationSignal: proc.signal,
+          }
+        : {}),
     };
 
     return {
@@ -949,6 +966,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
+      ...(succeededAfterTermination ? { succeededAfterTermination: true } : {}),
       errorFamily: transientUpstream ? "transient_upstream" : null,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,

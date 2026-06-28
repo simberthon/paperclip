@@ -1,11 +1,41 @@
 import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
+  isClaudeSuccessResult,
   isClaudeTransientUpstreamError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
 } from "./parse.js";
+
+describe("isClaudeSuccessResult", () => {
+  it("returns true for a clean success result", () => {
+    expect(isClaudeSuccessResult({ type: "result", subtype: "success", is_error: false })).toBe(true);
+  });
+
+  it("treats a success result with no is_error field as success", () => {
+    expect(isClaudeSuccessResult({ subtype: "success", result: "done" })).toBe(true);
+  });
+
+  it("is case-insensitive on the subtype", () => {
+    expect(isClaudeSuccessResult({ subtype: "SUCCESS", is_error: false })).toBe(true);
+  });
+
+  it("returns false when the result is flagged is_error even if subtype is success", () => {
+    expect(isClaudeSuccessResult({ subtype: "success", is_error: true })).toBe(false);
+  });
+
+  it("returns false for non-success subtypes", () => {
+    expect(isClaudeSuccessResult({ subtype: "error_max_turns" })).toBe(false);
+    expect(isClaudeSuccessResult({ subtype: "error_during_execution" })).toBe(false);
+  });
+
+  it("returns false for null/undefined/empty", () => {
+    expect(isClaudeSuccessResult(null)).toBe(false);
+    expect(isClaudeSuccessResult(undefined)).toBe(false);
+    expect(isClaudeSuccessResult({})).toBe(false);
+  });
+});
 
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as transient", () => {

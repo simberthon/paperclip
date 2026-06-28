@@ -992,6 +992,203 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
+  it("recovers a stranded agent from error to idle when its scheduled retry is suppressed (LUN-2682)", async () => {
+    const companyId = randomUUID();
+    const oldAgentId = randomUUID();
+    const newAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T14:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: oldAgentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        // Stranded: the spurious failed run left this agent in error.
+        status: "error",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: newAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: oldAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      error: "Claude run failed: subtype=success: <success summary>",
+      errorCode: "claude_transient_upstream",
+      finishedAt: now,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Strand recovery",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: oldAgentId,
+      executionRunId: sourceRunId,
+      executionAgentNameKey: "claudecoder",
+      executionLockedAt: now,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-2`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    // Work moves away mid-flight: the issue is reassigned to another agent.
+    await db.update(issues).set({ assigneeAgentId: newAgentId, updatedAt: now }).where(eq(issues.id, issueId));
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 0, runIds: [] });
+
+    const oldRetry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(oldRetry).toEqual({ status: "cancelled", errorCode: "issue_reassigned" });
+
+    // The previously-stranded agent is recovered to idle.
+    const oldAgent = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, oldAgentId))
+      .then((rows) => rows[0] ?? null);
+    expect(oldAgent?.status).toBe("idle");
+  });
+
+  it("does not recover an errored agent that still has another live run when a retry is suppressed (LUN-2682)", async () => {
+    const companyId = randomUUID();
+    const oldAgentId = randomUUID();
+    const newAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const otherLiveRunId = randomUUID();
+    const now = new Date("2026-04-20T14:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: oldAgentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "error",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+        permissions: {},
+      },
+      {
+        id: newAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: sourceRunId,
+        companyId,
+        agentId: oldAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        error: "upstream overload",
+        errorCode: "claude_transient_upstream",
+        finishedAt: now,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        updatedAt: now,
+        createdAt: now,
+      },
+      {
+        // Another live run for the same agent on different work.
+        id: otherLiveRunId,
+        companyId,
+        agentId: oldAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+        updatedAt: now,
+        createdAt: now,
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Strand recovery guard",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: oldAgentId,
+      executionRunId: sourceRunId,
+      executionAgentNameKey: "claudecoder",
+      executionLockedAt: now,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-2`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    await db.update(issues).set({ assigneeAgentId: newAgentId, updatedAt: now }).where(eq(issues.id, issueId));
+
+    await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+
+    // The agent still has a running run, so it must NOT be forced to idle.
+    const oldAgent = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, oldAgentId))
+      .then((rows) => rows[0] ?? null);
+    expect(oldAgent?.status).toBe("error");
+  });
+
   it("does not promote a scheduled retry after the issue is handed to a human owner", async () => {
     const companyId = randomUUID();
     const oldAgentId = randomUUID();

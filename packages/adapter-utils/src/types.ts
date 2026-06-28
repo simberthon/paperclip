@@ -74,6 +74,13 @@ export interface AdapterExecutionResult {
   errorCode?: string | null;
   errorFamily?: AdapterExecutionErrorFamily | null;
   retryNotBefore?: string | null;
+  /**
+   * Set when the run produced a clean terminal success result but the process
+   * exited non-zero because it was terminated mid-flush (e.g. SIGTERM → exit
+   * 143). The server treats this as a success even though `exitCode !== 0`, so a
+   * healthy agent is not stranded in `error` (LUN-2682).
+   */
+  succeededAfterTermination?: boolean;
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
   /**

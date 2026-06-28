@@ -5859,6 +5859,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { allowed: true };
   }
 
+  // LUN-2682: an agent left in `error` by a (often spurious) failed run is
+  // normally cleared when a later run starts. But if that run's only follow-up
+  // was a scheduled retry and the retry is then suppressed (issue reassigned,
+  // gone, terminal, blocked, …), no future run ever flips the agent back and it
+  // is stranded in `error` indefinitely. When we cancel such a retry and the
+  // agent has no other live run, recover it to `idle` so it can be assigned
+  // fresh work. Conservative: only ever touches an agent currently in `error`.
+  async function recoverAgentFromErrorIfNoLiveRuns(agentId: string, now: Date) {
+    const agent = await getAgent(agentId);
+    if (!agent || agent.status !== "error") return;
+
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+        ),
+      );
+    if (Number(count ?? 0) > 0) return;
+
+    const updated = await db
+      .update(agents)
+      .set({ status: "idle", updatedAt: now })
+      .where(and(eq(agents.id, agentId), eq(agents.status, "error")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (updated) {
+      logger.info(
+        { agentId, companyId: updated.companyId },
+        "recovered agent from error to idle after scheduled retry was suppressed (LUN-2682)",
+      );
+      publishLiveEvent({
+        companyId: updated.companyId,
+        type: "agent.status",
+        payload: {
+          agentId: updated.id,
+          status: updated.status,
+          lastHeartbeatAt: updated.lastHeartbeatAt
+            ? new Date(updated.lastHeartbeatAt).toISOString()
+            : null,
+          outcome: "recovered_from_error",
+        },
+      });
+    }
+  }
+
   async function cancelScheduledRetryForGate(
     run: typeof heartbeatRuns.$inferSelect,
     gate: Extract<ScheduledRetryGate, { allowed: false }>,
@@ -5927,6 +5976,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         scheduledRetryReason: cancelled.scheduledRetryReason,
       },
     });
+
+    await recoverAgentFromErrorIfNoLiveRuns(cancelled.agentId, now);
 
     return cancelled;
   }
@@ -9102,7 +9153,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome = latestRun.status;
       } else if (adapterResult.timedOut) {
         outcome = "timed_out";
-      } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
+      } else if (
+        // LUN-2682: an adapter may report a clean success that exited non-zero
+        // only because it was terminated mid-flush (e.g. SIGTERM → exit 143).
+        // Trust that explicit verdict so the agent is not stranded in `error`.
+        ((adapterResult.exitCode ?? 0) === 0 || adapterResult.succeededAfterTermination === true) &&
+        !adapterResult.errorMessage
+      ) {
         outcome = "succeeded";
       } else {
         outcome = "failed";

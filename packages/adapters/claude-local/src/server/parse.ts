@@ -1,5 +1,6 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
+  asBoolean,
   asString,
   asNumber,
   parseObject,
@@ -162,6 +163,21 @@ export function describeClaudeFailure(parsed: Record<string, unknown>): string |
   if (subtype) parts.push(`subtype=${subtype}`);
   if (detail) parts.push(detail);
   return parts.length > 1 ? parts.join(": ") : null;
+}
+
+/**
+ * True when the Claude CLI emitted a clean terminal success result
+ * (`subtype: "success"` with no `is_error`). The CLI only writes this final
+ * `type: "result"` event after the agentic turn has fully completed, so a
+ * non-zero process exit observed alongside it (e.g. SIGTERM mid-flush → exit
+ * 143) is a post-completion termination artifact, not a failed run. Callers use
+ * this to avoid stranding a healthy agent in `error` (LUN-2682).
+ */
+export function isClaudeSuccessResult(parsed: Record<string, unknown> | null | undefined): boolean {
+  if (!parsed) return false;
+  const subtype = asString(parsed.subtype, "").trim().toLowerCase();
+  if (subtype !== "success") return false;
+  return !asBoolean(parsed.is_error, false);
 }
 
 export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | undefined): boolean {

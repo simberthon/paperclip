@@ -112,7 +112,7 @@ import {
   RECOVERY_ORIGIN_KINDS,
 } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
-import { visibleIssueCondition } from "./issue-visibility.js";
+import { orphanedByClosedParentCondition, visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -513,6 +513,8 @@ export interface IssueFilters {
   workspaceId?: string;
   executionWorkspaceId?: string;
   parentId?: string;
+  /** Only issues whose parent is already `done` or `cancelled`. */
+  orphanedByClosedParent?: boolean;
   descendantOf?: string;
   labelId?: string;
   originKind?: string;
@@ -3757,6 +3759,7 @@ async function blockedInboxIssueConditions(
   }
   if (filters?.executionWorkspaceId) conditions.push(eq(issues.executionWorkspaceId, filters.executionWorkspaceId));
   if (filters?.parentId) conditions.push(eq(issues.parentId, filters.parentId));
+  if (filters?.orphanedByClosedParent) conditions.push(orphanedByClosedParentCondition());
   if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
   if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
   if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
@@ -4355,6 +4358,44 @@ export function issueService(db: Db) {
       wakeupRequestId: run.wakeupRequestId,
       contextSnapshot: run.contextSnapshot as Record<string, unknown> | null | undefined,
     });
+  }
+
+  /**
+   * An issue that belongs to nobody never starts and never surfaces: no
+   * heartbeat picks it up, and it appears in no assignee-scoped view. Boards
+   * silently accumulate them, high-priority work included.
+   *
+   * When a create names no assignee at all, the creator owns it by default —
+   * the one party we know exists and can route the work. Owning it beats the
+   * issue owning nobody.
+   *
+   * Both checks are best-effort on purpose: if the creator cannot legitimately
+   * hold work (paused, terminated, membership revoked), we leave the issue
+   * unassigned rather than fail a create that would otherwise have succeeded.
+   * A fallback owner must never be able to break issue creation.
+   */
+  async function resolveCreatorFallbackAssignee(
+    companyId: string,
+    createdByAgentId: string | null | undefined,
+    createdByUserId: string | null | undefined,
+  ): Promise<{ assigneeAgentId: string } | { assigneeUserId: string } | null> {
+    if (createdByAgentId) {
+      try {
+        await assertAssignableAgent(db, companyId, createdByAgentId, { kind: "work" });
+        return { assigneeAgentId: createdByAgentId };
+      } catch {
+        // fall through to the user candidate
+      }
+    }
+    if (createdByUserId) {
+      try {
+        await assertAssignableUser(companyId, createdByUserId);
+        return { assigneeUserId: createdByUserId };
+      } catch {
+        // leave the issue unassigned
+      }
+    }
+    return null;
   }
 
   async function assertAssignableUser(companyId: string, userId: string) {
@@ -5103,6 +5144,7 @@ export function issueService(db: Db) {
         conditions.push(eq(issues.executionWorkspaceId, filters.executionWorkspaceId));
       }
       if (filters?.parentId) conditions.push(eq(issues.parentId, filters.parentId));
+      if (filters?.orphanedByClosedParent) conditions.push(orphanedByClosedParentCondition());
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
@@ -5281,6 +5323,7 @@ export function issueService(db: Db) {
       }
       if (filters?.executionWorkspaceId) conditions.push(eq(issues.executionWorkspaceId, filters.executionWorkspaceId));
       if (filters?.parentId) conditions.push(eq(issues.parentId, filters.parentId));
+      if (filters?.orphanedByClosedParent) conditions.push(orphanedByClosedParentCondition());
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
@@ -6490,6 +6533,14 @@ export function issueService(db: Db) {
       }
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
+      }
+      if (!data.assigneeAgentId && !data.assigneeUserId) {
+        const fallbackAssignee = await resolveCreatorFallbackAssignee(
+          companyId,
+          issueData.createdByAgentId,
+          issueData.createdByUserId,
+        );
+        if (fallbackAssignee) Object.assign(issueData, fallbackAssignee);
       }
       return db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;

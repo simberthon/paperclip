@@ -21,7 +21,7 @@ import { ActivityRow } from "../components/ActivityRow";
 import { Identity } from "../components/Identity";
 import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
-import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
+import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle, UserX } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -256,7 +256,36 @@ export function Dashboard() {
             </div>
           ) : null}
 
-          <div className="grid grid-cols-2 xl:grid-cols-4 gap-1 sm:gap-2">
+          {/*
+            Open children of a closed parent collapse out of the issue tree, so
+            they are invisible to anyone browsing the hierarchy and only ever
+            resurface in a manual audit. Surface the count where it cannot be
+            missed, with a direct link to the list.
+          */}
+          {data.tasks.orphanedByClosedParent > 0 ? (
+            <div className="flex items-start justify-between gap-3 rounded-xl border border-amber-500/20 px-4 py-3">
+              <div className="flex items-start gap-2.5">
+                <UserX className="mt-0.5 h-4 w-4 shrink-0 text-amber-700 dark:text-amber-300" />
+                <div>
+                  <p className="text-sm font-medium text-amber-950 dark:text-amber-50">
+                    {data.tasks.orphanedByClosedParent} open task
+                    {data.tasks.orphanedByClosedParent === 1 ? "" : "s"} under a closed parent
+                  </p>
+                  <p className="text-xs text-amber-900/70 dark:text-amber-100/70">
+                    Hidden in the task tree because the parent is already done or cancelled
+                  </p>
+                </div>
+              </div>
+              <Link
+                to="/issues?orphanedByClosedParent=true"
+                className="text-sm underline underline-offset-2 text-amber-900 dark:text-amber-100 shrink-0"
+              >
+                Review them
+              </Link>
+            </div>
+          ) : null}
+
+          <div className="grid grid-cols-2 xl:grid-cols-5 gap-1 sm:gap-2">
             <MetricCard
               icon={Bot}
               value={data.agents.active + data.agents.running + data.agents.paused + data.agents.error}
@@ -281,6 +310,18 @@ export function Dashboard() {
                   {data.tasks.blocked} blocked
                 </span>
               }
+            />
+            {/*
+              Open work no heartbeat will ever pick up, because nothing owns it.
+              Links to the server-filtered list so the number is actionable
+              rather than merely alarming.
+            */}
+            <MetricCard
+              icon={UserX}
+              value={data.tasks.unassigned}
+              label="Unassigned Tasks"
+              to="/issues?assigneeAgentId=null"
+              description={<span>of {data.tasks.open} open</span>}
             />
             <MetricCard
               icon={DollarSign}

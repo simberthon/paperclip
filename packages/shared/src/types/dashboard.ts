@@ -37,6 +37,10 @@ export interface DashboardSummary {
     inProgress: number;
     blocked: number;
     done: number;
+    /** Open issues with no assignee at all — nothing will ever pick these up. */
+    unassigned: number;
+    /** Open issues whose parent is already done or cancelled. */
+    orphanedByClosedParent: number;
   };
   costs: {
     monthSpendCents: number;

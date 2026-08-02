@@ -167,6 +167,7 @@ import {
   saveLastInboxTab,
   shouldShowCompanyAlerts,
   shouldShowInboxSection,
+  sortIssuesByMostRecentActivity,
   type InboxGroupedSection,
   type InboxTab,
   type InboxWorkItem,
@@ -1008,8 +1009,16 @@ export function Inbox() {
   const inboxTruncation = useMemo(() => {
     const result = tab === "mine" ? mineIssuesResult : touchedIssuesResult;
     if (!result.truncated) return null;
-    return { shown: result.issues.length, total: result.totalCount };
-  }, [mineIssuesResult, tab, touchedIssuesResult]);
+    // The server page is itself capped at INBOX_ISSUE_LIST_LIMIT, so a raw row
+    // count that lands exactly on the cap is a floor, not a total. Saying
+    // "of 500" there would be a second silent truncation dressed up as a fact.
+    const raw = tab === "mine" ? mineIssuesRaw.length : touchedIssuesRaw.length;
+    return {
+      shown: result.issues.length,
+      total: result.totalCount,
+      totalIsFloor: raw >= INBOX_ISSUE_LIST_LIMIT,
+    };
+  }, [mineIssuesRaw.length, mineIssuesResult, tab, touchedIssuesRaw.length, touchedIssuesResult]);
   const shouldUseIssueSearchSupplement =
     !!selectedCompanyId
     && normalizedSearchQuery.length > 0;
@@ -1565,6 +1574,17 @@ export function Inbox() {
       }
       return next;
     });
+  }, [loadHiddenChildIssues]);
+  // Same collapse semantics as a normal parent, plus a one-shot fetch so the
+  // children the cap dropped join the ones it kept (LUN-4376).
+  const toggleLoadedParentChildren = useCallback((parentId: string) => {
+    setCollapsedInboxParents((prev) => {
+      const next = new Set(prev);
+      if (next.has(parentId)) next.delete(parentId);
+      else next.add(parentId);
+      return next;
+    });
+    loadHiddenChildIssues(parentId);
   }, [loadHiddenChildIssues]);
   const toggleInboxParentCollapse = useCallback((parentId: string) => {
     setCollapsedInboxParents((prev) => {
@@ -3090,10 +3110,20 @@ export function Inbox() {
                     } => {
                       const loaded = group.childrenByIssueId.get(target.id) ?? [];
                       if (loaded.length > 0) {
+                        // Partly-loaded parent: the client cap can drop some of
+                        // its children while keeping others, so the siblings it
+                        // dropped were reachable from nowhere. Expanding merges
+                        // in whatever the on-demand fetch returned.
+                        const loadedIds = new Set(loaded.map((child) => child.id));
+                        const extra = (lazyChildIssues.get(target.id) ?? [])
+                          .filter((child) => !loadedIds.has(child.id));
                         return {
-                          children: loaded,
+                          children: extra.length > 0
+                            ? [...loaded, ...extra].sort(sortIssuesByMostRecentActivity)
+                            : loaded,
                           hasChildren: true,
                           isExpanded: !collapsedInboxParents.has(target.id),
+                          onToggleExpand: toggleLoadedParentChildren,
                         };
                       }
                       const fetched = lazyChildIssues.get(target.id) ?? [];
@@ -3210,7 +3240,7 @@ export function Inbox() {
                 className="flex items-center justify-between gap-3 border-t border-border px-4 py-2 text-xs text-muted-foreground"
               >
                 <span>
-                  Showing {inboxTruncation.shown} of {inboxTruncation.total} items, most recent activity first.
+                  Showing {inboxTruncation.shown} of {inboxTruncation.totalIsFloor ? `${inboxTruncation.total}+` : inboxTruncation.total} items, most recent activity first.
                 </span>
                 <Link to="/issues" className="underline underline-offset-2 hover:text-foreground">
                   View all issues

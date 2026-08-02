@@ -498,6 +498,71 @@ describe("Inbox toolbar", () => {
     root.unmount();
   });
 
+  it("pulls in the siblings the cap dropped when a partly-loaded parent is expanded", async () => {
+    // LUN-4376 follow-up: a parent whose children only partly survived the
+    // client cap used to short-circuit on the loaded ones, so the dropped
+    // siblings were reachable from nowhere.
+    routerMock.location.pathname = "/inbox/mine";
+    const parent = createIssue({ id: "issue-parent", identifier: "PAP-4001", title: "Parent with two sub-tasks" });
+    const loadedChild = createIssue({
+      id: "issue-child-loaded",
+      identifier: "PAP-4002",
+      title: "Sub-task that survived the cap",
+      parentId: parent.id,
+    });
+    const droppedChild = createIssue({
+      id: "issue-child-dropped",
+      identifier: "PAP-4003",
+      title: "Sub-task the cap dropped",
+      parentId: parent.id,
+    });
+    apiMocks.issuesList.mockImplementation((_companyId: string, filters?: { parentId?: string }) =>
+      Promise.resolve(
+        filters?.parentId === parent.id ? [loadedChild, droppedChild] : [parent, loadedChild],
+      ),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <Inbox />
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain("Sub-task that survived the cap");
+    });
+    expect(container.textContent).not.toContain("Sub-task the cap dropped");
+
+    const parentRow = Array.from(container.querySelectorAll("[data-inbox-item]")).find((row) =>
+      row.textContent?.includes("Parent with two sub-tasks"),
+    )!;
+    const chevron = parentRow.querySelector<HTMLButtonElement>('button[data-slot="icon-button"]')!;
+    // Collapse, then expand: the toggle is what triggers the one-shot fetch.
+    await act(async () => {
+      chevron.click();
+    });
+    await act(async () => {
+      chevron.click();
+    });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain("Sub-task the cap dropped");
+    });
+    // The child that was already on the page must not be duplicated.
+    expect(
+      Array.from(container.querySelectorAll("[data-inbox-item]")).filter((row) =>
+        row.textContent?.includes("Sub-task that survived the cap"),
+      ).length,
+    ).toBe(1);
+
+    root.unmount();
+  });
+
   it("paints row hover via CSS only, without moving React selection state", async () => {
     routerMock.location.pathname = "/inbox/mine";
     const issueA = createIssue({ id: "issue-a", identifier: "PAP-1001", title: "First inbox row" });

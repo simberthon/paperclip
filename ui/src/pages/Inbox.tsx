@@ -140,7 +140,8 @@ import {
   getInboxSearchSupplementIssues,
   getLatestFailedRunsByAgent,
   matchesInboxIssueSearch,
-  getRecentTouchedIssues,
+  getRecentTouchedIssuesWithMeta,
+  RECENT_ISSUES_LIMIT,
   isInboxEntityDismissed,
   isMineInboxTab,
   loadCollapsedInboxGroupKeys,
@@ -182,6 +183,21 @@ import {
 
 const INBOX_HEARTBEAT_RUN_LIMIT = 200;
 const INBOX_ISSUE_LIST_LIMIT = 500;
+/**
+ * Sub-tasks an agent creates under a ticket you follow are yours too — ask the
+ * server for the whole touched subtree, not just the rows you personally
+ * touched (LUN-4376). Part of the query key so the cache busts on rollout.
+ */
+const INBOX_TOUCHED_SCOPE = "subtree" as const;
+/**
+ * The server caps at INBOX_ISSUE_LIST_LIMIT and the inbox renders by most
+ * recent activity, so the cap has to cut on the same axis the list is ordered
+ * by — otherwise the page is truncated by priority and re-sorted by activity,
+ * and rows silently vanish.
+ */
+const INBOX_TOUCHED_SORT = { sortField: "updated", sortDir: "desc" } as const;
+/** Children fetched on demand when a parent's descendants are off-page. */
+const INBOX_HIDDEN_CHILD_LIMIT = 100;
 const INBOX_HOT_PATH_STALE_MS = 30_000;
 
 export { InboxIssueMetaLeading, InboxIssueTrailingColumns } from "../components/IssueColumns";
@@ -872,21 +888,23 @@ export function Inbox() {
     isLoading: isMineIssuesLoading,
     dataUpdatedAt: mineIssuesUpdatedAt,
   } = useQuery({
-    queryKey: [...queryKeys.issues.listMineByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const,
+    queryKey: [...queryKeys.issues.listMineByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT, INBOX_TOUCHED_SCOPE] as const,
     queryFn: () =>
       issuesApi.listCompact(selectedCompanyId!, {
         touchedByUserId: "me",
+        touchedByUserScope: INBOX_TOUCHED_SCOPE,
         inboxArchivedByUserId: "me",
         status: INBOX_MINE_ISSUE_STATUS_FILTER,
         includeRoutineExecutions: true,
         includeLiveDescendantSummary: true,
         limit: INBOX_ISSUE_LIST_LIMIT,
+        ...INBOX_TOUCHED_SORT,
       }).then((rows) => rows as Issue[]),
     enabled: !!selectedCompanyId,
     refetchOnWindowFocus: false,
     staleTime: INBOX_HOT_PATH_STALE_MS,
   });
-  const mineIssuesQueryKey = [...queryKeys.issues.listMineByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const;
+  const mineIssuesQueryKey = [...queryKeys.issues.listMineByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT, INBOX_TOUCHED_SCOPE] as const;
   const sharedMineIssues = useSharedPollingQuery<Issue[]>({
     companyId: selectedCompanyId,
     resourceKey: "inbox:mine-issues",
@@ -899,20 +917,22 @@ export function Inbox() {
     isLoading: isTouchedIssuesLoading,
     dataUpdatedAt: touchedIssuesUpdatedAt,
   } = useQuery({
-    queryKey: [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const,
+    queryKey: [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT, INBOX_TOUCHED_SCOPE] as const,
     queryFn: () =>
       issuesApi.listCompact(selectedCompanyId!, {
         touchedByUserId: "me",
+        touchedByUserScope: INBOX_TOUCHED_SCOPE,
         status: INBOX_MINE_ISSUE_STATUS_FILTER,
         includeRoutineExecutions: true,
         includeLiveDescendantSummary: true,
         limit: INBOX_ISSUE_LIST_LIMIT,
+        ...INBOX_TOUCHED_SORT,
       }).then((rows) => rows as Issue[]),
     enabled: !!selectedCompanyId,
     refetchOnWindowFocus: false,
     staleTime: INBOX_HOT_PATH_STALE_MS,
   });
-  const touchedIssuesQueryKey = [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const;
+  const touchedIssuesQueryKey = [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT, INBOX_TOUCHED_SCOPE] as const;
   const sharedTouchedIssues = useSharedPollingQuery<Issue[]>({
     companyId: selectedCompanyId,
     resourceKey: "inbox:touched-issues",
@@ -973,14 +993,24 @@ export function Inbox() {
     [companyMembers?.users],
   );
 
-  const mineIssues = useMemo(
-    () => getRecentTouchedIssues(mineIssuesRaw).filter((issue) => !locallyArchivedIssueIds.has(issue.id)),
+  // Archived rows are dropped *before* the cap, otherwise they burn slots and
+  // silently shrink the visible list below RECENT_ISSUES_LIMIT.
+  const mineIssuesResult = useMemo(
+    () => getRecentTouchedIssuesWithMeta(mineIssuesRaw.filter((issue) => !locallyArchivedIssueIds.has(issue.id))),
     [locallyArchivedIssueIds, mineIssuesRaw],
   );
-  const touchedIssues = useMemo(
-    () => getRecentTouchedIssues(touchedIssuesRaw).filter((issue) => !locallyArchivedIssueIds.has(issue.id)),
+  const touchedIssuesResult = useMemo(
+    () => getRecentTouchedIssuesWithMeta(touchedIssuesRaw.filter((issue) => !locallyArchivedIssueIds.has(issue.id))),
     [locallyArchivedIssueIds, touchedIssuesRaw],
   );
+  const mineIssues = mineIssuesResult.issues;
+  const touchedIssues = touchedIssuesResult.issues;
+  // The client cap used to drop rows silently. Say so, and give a way out.
+  const inboxTruncation = useMemo(() => {
+    const result = tab === "mine" ? mineIssuesResult : touchedIssuesResult;
+    if (!result.truncated) return null;
+    return { shown: result.issues.length, total: result.totalCount };
+  }, [mineIssuesResult, tab, touchedIssuesResult]);
   const shouldUseIssueSearchSupplement =
     !!selectedCompanyId
     && normalizedSearchQuery.length > 0;
@@ -1495,6 +1525,48 @@ export function Inbox() {
     () => groupedSections.reduce((count, group) => count + group.displayItems.length, 0),
     [groupedSections],
   );
+  // --- Hidden children (LUN-4376) ---
+  // A row can advertise "N live below" while none of those descendants are in
+  // the fetched page, which used to leave a count with no way to open it.
+  // Expanding such a row fetches its children on demand.
+  const [lazyChildIssues, setLazyChildIssues] = useState<Map<string, Issue[]>>(new Map());
+  const [lazyExpandedParents, setLazyExpandedParents] = useState<Set<string>>(new Set());
+  const lazyChildFetchesRef = useRef<Set<string>>(new Set());
+  const loadHiddenChildIssues = useCallback((parentId: string) => {
+    if (!selectedCompanyId || lazyChildFetchesRef.current.has(parentId)) return;
+    lazyChildFetchesRef.current.add(parentId);
+    issuesApi
+      .listCompact(selectedCompanyId, {
+        parentId,
+        includeRoutineExecutions: true,
+        includeLiveDescendantSummary: true,
+        limit: INBOX_HIDDEN_CHILD_LIMIT,
+        ...INBOX_TOUCHED_SORT,
+      })
+      .then((rows) => {
+        setLazyChildIssues((prev) => {
+          const next = new Map(prev);
+          next.set(parentId, rows as Issue[]);
+          return next;
+        });
+      })
+      .catch(() => {
+        // Let the next expand retry instead of pinning an empty subtree.
+        lazyChildFetchesRef.current.delete(parentId);
+      });
+  }, [selectedCompanyId]);
+  const toggleHiddenChildren = useCallback((parentId: string) => {
+    setLazyExpandedParents((prev) => {
+      const next = new Set(prev);
+      if (next.has(parentId)) {
+        next.delete(parentId);
+      } else {
+        next.add(parentId);
+        loadHiddenChildIssues(parentId);
+      }
+      return next;
+    });
+  }, [loadHiddenChildIssues]);
   const toggleInboxParentCollapse = useCallback((parentId: string) => {
     setCollapsedInboxParents((prev) => {
       const next = new Set(prev);
@@ -2645,6 +2717,7 @@ export function Inbox() {
                   isExpanded = false,
                   childCount = 0,
                   collapseParentId = null,
+                  onToggleExpand,
                   allowArchive = canArchiveFromTab,
                 }: {
                   issue: Issue;
@@ -2654,8 +2727,10 @@ export function Inbox() {
                   isExpanded?: boolean;
                   childCount?: number;
                   collapseParentId?: string | null;
+                  onToggleExpand?: (parentId: string) => void;
                   allowArchive?: boolean;
                 }) => {
+                  const toggleExpand = onToggleExpand ?? toggleInboxParentCollapse;
                   const isUnread = issue.isUnreadForMe && !fadingOutIssues.has(issue.id);
                   const isFading = fadingOutIssues.has(issue.id);
                   const isArchiving = archivingIssueIds.has(issue.id);
@@ -2707,7 +2782,7 @@ export function Inbox() {
                                 onClick={(event) => {
                                   event.preventDefault();
                                   event.stopPropagation();
-                                  toggleInboxParentCollapse(collapseParentId);
+                                  toggleExpand(collapseParentId);
                                 }}
                               >
                                 <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", isExpanded && "rotate-90")} />
@@ -2732,7 +2807,7 @@ export function Inbox() {
                           />
                         </>
                       }
-                      titleSuffix={hasChildren && !isExpanded && depth === 0 ? (
+                      titleSuffix={hasChildren && childCount > 0 && !isExpanded && depth === 0 ? (
                         <span className="ml-1.5 text-xs text-muted-foreground">
                           ({childCount} sub-task{childCount !== 1 ? "s" : ""})
                         </span>
@@ -2746,7 +2821,7 @@ export function Inbox() {
                             onClick={(event) => {
                               event.preventDefault();
                               event.stopPropagation();
-                              toggleInboxParentCollapse(collapseParentId);
+                              toggleExpand(collapseParentId);
                             }}
                           >
                             <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", isExpanded && "rotate-90")} />
@@ -3004,9 +3079,43 @@ export function Inbox() {
                     }
 
                     const issue = item.issue;
-                    const childIssues = group.childrenByIssueId.get(issue.id) ?? [];
-                    const hasChildren = childIssues.length > 0;
-                    const isExpanded = hasChildren && !collapsedInboxParents.has(issue.id);
+                    // Children already on the page, plus any pulled in by an
+                    // on-demand expand. A row that only advertises descendants
+                    // it never shipped still gets a chevron, and expanding it
+                    // fetches them (LUN-4376).
+                    const resolveInboxChildren = (target: Issue): {
+                      children: Issue[];
+                      hasChildren: boolean;
+                      isExpanded: boolean;
+                      onToggleExpand?: (parentId: string) => void;
+                    } => {
+                      const loaded = group.childrenByIssueId.get(target.id) ?? [];
+                      if (loaded.length > 0) {
+                        return {
+                          children: loaded,
+                          hasChildren: true,
+                          isExpanded: !collapsedInboxParents.has(target.id),
+                        };
+                      }
+                      const fetched = lazyChildIssues.get(target.id) ?? [];
+                      const descendantCount = resolveIssueLiveDescendantCount(
+                        target,
+                        subtreeLiveCounts.get(target.id) ?? 0,
+                      );
+                      if (fetched.length === 0 && descendantCount <= 0) {
+                        return { children: [], hasChildren: false, isExpanded: false };
+                      }
+                      return {
+                        children: fetched,
+                        hasChildren: true,
+                        isExpanded: lazyExpandedParents.has(target.id),
+                        onToggleExpand: toggleHiddenChildren,
+                      };
+                    };
+                    const parentChildren = resolveInboxChildren(issue);
+                    const childIssues = parentChildren.children;
+                    const hasChildren = parentChildren.hasChildren;
+                    const isExpanded = parentChildren.isExpanded;
                     const canArchiveIssue = canArchiveFromTab && group.searchSection === "none";
                     const renderChildIssueRows = (
                       children: Issue[],
@@ -3019,9 +3128,10 @@ export function Inbox() {
                         nextSeen.add(child.id);
                         const childNavIdx = childFlatIndex.get(child.id) ?? -1;
                         const isChildSelected = selectedIndex === childNavIdx;
-                        const grandchildIssues = group.childrenByIssueId.get(child.id) ?? [];
-                        const childHasChildren = grandchildIssues.length > 0;
-                        const childIsExpanded = childHasChildren && !collapsedInboxParents.has(child.id);
+                        const childChildren = resolveInboxChildren(child);
+                        const grandchildIssues = childChildren.children;
+                        const childHasChildren = childChildren.hasChildren;
+                        const childIsExpanded = childChildren.isExpanded;
                         const childRow = renderInboxIssue({
                           issue: child,
                           depth,
@@ -3030,6 +3140,7 @@ export function Inbox() {
                           isExpanded: childIsExpanded,
                           childCount: grandchildIssues.length,
                           collapseParentId: child.id,
+                          onToggleExpand: childChildren.onToggleExpand,
                           allowArchive: canArchiveIssue,
                         });
                         const isChildArchiving = archivingIssueIds.has(child.id);
@@ -3070,6 +3181,7 @@ export function Inbox() {
                       isExpanded,
                       childCount: childIssues.length,
                       collapseParentId: issue.id,
+                      onToggleExpand: parentChildren.onToggleExpand,
                       allowArchive: canArchiveIssue,
                     });
 
@@ -3093,6 +3205,19 @@ export function Inbox() {
                 });
               })()}
             </div>
+            {inboxTruncation && (
+              <div
+                data-testid="inbox-truncation-notice"
+                className="flex items-center justify-between gap-3 border-t border-border px-4 py-2 text-xs text-muted-foreground"
+              >
+                <span>
+                  Showing {inboxTruncation.shown} of {inboxTruncation.total} items, most recent activity first.
+                </span>
+                <Link to="/issues" className="underline underline-offset-2 hover:text-foreground">
+                  View all issues
+                </Link>
+              </div>
+            )}
           </div>
         </>
       )}

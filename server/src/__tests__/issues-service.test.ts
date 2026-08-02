@@ -402,6 +402,62 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     ]);
   });
 
+  it("surfaces agent-created descendants of a touched issue only under the subtree scope", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const userId = "board-user";
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const grandchildId = randomUUID();
+    const unrelatedId = randomUUID();
+
+    // The parent is touched by the user; everything below it is agent-created
+    // and agent-assigned, so it matches none of the four "self" touch branches.
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Parent the user follows",
+        status: "todo",
+        priority: "medium",
+        createdByUserId: userId,
+      },
+      {
+        id: childId,
+        companyId,
+        parentId,
+        title: "Sub-task an agent created",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: grandchildId,
+        companyId,
+        parentId: childId,
+        title: "Sub-sub-task an agent created",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: unrelatedId,
+        companyId,
+        title: "Issue the user never touched",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const selfScoped = await svc.list(companyId, { touchedByUserId: userId });
+    expect(selfScoped.map((issue) => issue.id)).toEqual([parentId]);
+
+    const subtreeScoped = await svc.list(companyId, {
+      touchedByUserId: userId,
+      touchedByUserScope: "subtree",
+    });
+    expect([...subtreeScoped.map((issue) => issue.id)].sort()).toEqual(
+      [parentId, childId, grandchildId].sort(),
+    );
+  });
+
   function agentRow(companyId: string, input: {
     id: string;
     name: string;

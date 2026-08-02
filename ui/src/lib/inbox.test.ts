@@ -38,6 +38,7 @@ import {
   loadLastInboxTab,
   matchesInboxIssueSearch,
   normalizeInboxIssueColumns,
+  getRecentTouchedIssuesWithMeta,
   RECENT_ISSUES_LIMIT,
   resolveInboxNestingEnabled,
   resolveIssueWorkspaceName,
@@ -818,6 +819,46 @@ describe("inbox helpers", () => {
 
     expect(recentIssues).toHaveLength(RECENT_ISSUES_LIMIT);
     expect(getUnreadTouchedIssues(recentIssues).map((issue) => issue.id)).toEqual(["1", "2", "3"]);
+  });
+
+  it("reports how many issues the recent cap dropped", () => {
+    const issues = Array.from({ length: RECENT_ISSUES_LIMIT + 5 }, (_, index) => {
+      const issue = makeIssue(String(index + 1), false);
+      issue.lastActivityAt = new Date(Date.UTC(2026, 2, 31, 0, 0, 0, 0) - index * 60_000);
+      return issue;
+    });
+
+    const capped = getRecentTouchedIssuesWithMeta(issues);
+    expect(capped.truncated).toBe(true);
+    expect(capped.totalCount).toBe(RECENT_ISSUES_LIMIT + 5);
+    expect(capped.issues).toHaveLength(RECENT_ISSUES_LIMIT);
+
+    const uncapped = getRecentTouchedIssuesWithMeta(issues.slice(0, 3));
+    expect(uncapped.truncated).toBe(false);
+    expect(uncapped.totalCount).toBe(3);
+  });
+
+  it("keeps an out-of-cap parent when one of its sub-tasks survives the cap", () => {
+    // The parent is the least recently active row, so the cap cuts it; its
+    // sub-task is the most recent. Without the parent the child would render as
+    // an orphan root with no chevron (LUN-4376).
+    const parent = makeIssue("parent", false);
+    parent.lastActivityAt = new Date(Date.UTC(2026, 0, 1, 0, 0, 0, 0));
+    const child = makeIssue("child", false);
+    child.parentId = parent.id;
+    child.lastActivityAt = new Date(Date.UTC(2026, 2, 31, 0, 0, 0, 0));
+    const filler = Array.from({ length: RECENT_ISSUES_LIMIT }, (_, index) => {
+      const issue = makeIssue(`filler-${index}`, false);
+      issue.lastActivityAt = new Date(Date.UTC(2026, 1, 1, 0, 0, 0, 0) - index * 60_000);
+      return issue;
+    });
+
+    const result = getRecentTouchedIssuesWithMeta([parent, child, ...filler]);
+
+    const ids = result.issues.map((issue) => issue.id);
+    expect(ids).toContain(child.id);
+    expect(ids).toContain(parent.id);
+    expect(result.totalCount).toBe(RECENT_ISSUES_LIMIT + 2);
   });
 
   it("matches workspace names when inbox issue search includes workspace labels", () => {

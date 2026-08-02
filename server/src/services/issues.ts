@@ -507,6 +507,13 @@ export interface IssueFilters {
   participantAgentId?: string;
   assigneeUserId?: string;
   touchedByUserId?: string;
+  /**
+   * How far `touchedByUserId` / `unreadForUserId` reach.
+   * - `self` (default): only issues the user personally touched.
+   * - `subtree`: also every descendant of a touched issue, so sub-tasks an
+   *   agent created under a followed ticket stay visible (LUN-4376).
+   */
+  touchedByUserScope?: "self" | "subtree";
   inboxArchivedByUserId?: string;
   unreadForUserId?: string;
   projectId?: string;
@@ -1386,7 +1393,7 @@ const ISSUE_USER_PARTICIPATION_ACTIVITY_ACTIONS = [
   "issue.work_product_updated",
 ] as const;
 
-function touchedByUserCondition(companyId: string, userId: string) {
+function touchedByUserSelfCondition(companyId: string, userId: string) {
   return sql<boolean>`
     (
       ${issues.createdByUserId} = ${userId}
@@ -1413,6 +1420,64 @@ function touchedByUserCondition(companyId: string, userId: string) {
       )
     )
   `;
+}
+
+/**
+ * Inbox visibility for a user.
+ *
+ * `self` scope (default, historical behaviour) matches only issues the user
+ * personally created, was assigned, acted on, or commented on. A sub-task an
+ * agent created under a ticket the user follows matches none of those, so it
+ * never reaches the inbox — see LUN-4376.
+ *
+ * `subtree` scope adds every descendant of a touched issue. It is expressed as
+ * a single non-correlated `IN (WITH RECURSIVE ...)` subquery so Postgres
+ * evaluates the closure once per statement (hashed subplan) instead of once per
+ * candidate row. The recursion seeds on the touched set and walks *down* the
+ * parent chain; `UNION` (not `UNION ALL`) dedupes and terminates on cycles.
+ *
+ * The seed only keeps touched issues that actually have a child: a childless
+ * seed can only ever contribute itself, which the `self` branch already covers.
+ * That prune keeps the expensive activity_log/comment EXISTS off most of the
+ * table. Measured on the 4359-issue local instance (309 open): self 10.4ms,
+ * subtree 22.6ms; without the prune subtree was 50.7ms for the same 195 rows.
+ */
+function touchedByUserCondition(
+  companyId: string,
+  userId: string,
+  options?: { includeDescendants?: boolean },
+) {
+  const selfCondition = touchedByUserSelfCondition(companyId, userId);
+  if (!options?.includeDescendants) return selfCondition;
+  return sql<boolean>`
+    (
+      ${selfCondition}
+      OR ${issues.id} IN (
+        WITH RECURSIVE touched_subtree(id) AS (
+          SELECT ${issues.id}
+          FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId}
+            AND EXISTS (
+              SELECT 1
+              FROM issues touched_subtree_child
+              WHERE touched_subtree_child.parent_id = ${issues.id}
+                AND touched_subtree_child.company_id = ${companyId}
+            )
+            AND ${selfCondition}
+          UNION
+          SELECT ${issues.id}
+          FROM ${issues}
+          JOIN touched_subtree ON ${issues.parentId} = touched_subtree.id
+          WHERE ${issues.companyId} = ${companyId}
+        )
+        SELECT id FROM touched_subtree
+      )
+    )
+  `;
+}
+
+function parseTouchedByUserScope(value: unknown): "self" | "subtree" {
+  return value === "subtree" ? "subtree" : "self";
 }
 
 function participatedByAgentCondition(companyId: string, agentId: string) {
@@ -1522,8 +1587,12 @@ function issueCanonicalLastActivityAtExpr(companyId: string) {
   `;
 }
 
-function unreadForUserCondition(companyId: string, userId: string) {
-  const touchedCondition = touchedByUserCondition(companyId, userId);
+function unreadForUserCondition(
+  companyId: string,
+  userId: string,
+  options?: { includeDescendants?: boolean },
+) {
+  const touchedCondition = touchedByUserCondition(companyId, userId, options);
   const myLastTouchAt = myLastTouchAtExpr(companyId, userId);
   return sql<boolean>`
     (
@@ -3747,9 +3816,10 @@ async function blockedInboxIssueConditions(
   }
   if (filters?.participantAgentId) conditions.push(participatedByAgentCondition(companyId, filters.participantAgentId));
   if (filters?.assigneeUserId) conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));
-  if (touchedByUserId) conditions.push(touchedByUserCondition(companyId, touchedByUserId));
+  const touchScope = { includeDescendants: parseTouchedByUserScope(filters?.touchedByUserScope) === "subtree" };
+  if (touchedByUserId) conditions.push(touchedByUserCondition(companyId, touchedByUserId, touchScope));
   if (inboxArchivedByUserId) conditions.push(inboxVisibleForUserCondition(companyId, inboxArchivedByUserId));
-  if (unreadForUserId) conditions.push(unreadForUserCondition(companyId, unreadForUserId));
+  if (unreadForUserId) conditions.push(unreadForUserCondition(companyId, unreadForUserId, touchScope));
   if (filters?.projectId) conditions.push(eq(issues.projectId, filters.projectId));
   if (filters?.workspaceId) {
     conditions.push(or(
@@ -5124,14 +5194,17 @@ export function issueService(db: Db) {
       if (filters?.assigneeUserId) {
         conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));
       }
+      const touchScope = {
+        includeDescendants: parseTouchedByUserScope(filters?.touchedByUserScope) === "subtree",
+      };
       if (touchedByUserId) {
-        conditions.push(touchedByUserCondition(companyId, touchedByUserId));
+        conditions.push(touchedByUserCondition(companyId, touchedByUserId, touchScope));
       }
       if (inboxArchivedByUserId) {
         conditions.push(inboxVisibleForUserCondition(companyId, inboxArchivedByUserId));
       }
       if (unreadForUserId) {
-        conditions.push(unreadForUserCondition(companyId, unreadForUserId));
+        conditions.push(unreadForUserCondition(companyId, unreadForUserId, touchScope));
       }
       if (filters?.projectId) conditions.push(eq(issues.projectId, filters.projectId));
       if (filters?.workspaceId) {

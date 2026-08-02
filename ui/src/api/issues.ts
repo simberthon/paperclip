@@ -49,6 +49,11 @@ export type IssueListFilters = {
   participantAgentId?: string;
   assigneeUserId?: string;
   touchedByUserId?: string;
+  /**
+   * `subtree` also matches descendants of a touched issue, so sub-tasks an
+   * agent created under a followed ticket stay visible (LUN-4376).
+   */
+  touchedByUserScope?: "self" | "subtree";
   inboxArchivedByUserId?: string;
   unreadForUserId?: string;
   labelId?: string;
@@ -82,6 +87,7 @@ function issueListSearchParams(filters?: IssueListFilters) {
   if (filters?.participantAgentId) params.set("participantAgentId", filters.participantAgentId);
   if (filters?.assigneeUserId) params.set("assigneeUserId", filters.assigneeUserId);
   if (filters?.touchedByUserId) params.set("touchedByUserId", filters.touchedByUserId);
+  if (filters?.touchedByUserScope === "subtree") params.set("touchedByUserScope", "subtree");
   if (filters?.inboxArchivedByUserId) params.set("inboxArchivedByUserId", filters.inboxArchivedByUserId);
   if (filters?.unreadForUserId) params.set("unreadForUserId", filters.unreadForUserId);
   if (filters?.labelId) params.set("labelId", filters.labelId);

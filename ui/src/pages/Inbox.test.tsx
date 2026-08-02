@@ -441,6 +441,63 @@ describe("Inbox toolbar", () => {
     });
   });
 
+  it("gives a row with off-page descendants a chevron that fetches them on expand", async () => {
+    // LUN-4376: the row advertised "N live below" from the server summary while
+    // none of those descendants were in the fetched page, so there was a count
+    // with no way to open it.
+    routerMock.location.pathname = "/inbox/mine";
+    const parent = createIssue({
+      id: "issue-parent",
+      identifier: "PAP-3001",
+      title: "Parent with hidden sub-tasks",
+      liveDescendantCount: 2,
+    });
+    const hiddenChild = createIssue({
+      id: "issue-hidden-child",
+      identifier: "PAP-3002",
+      title: "Sub-task fetched on expand",
+      parentId: parent.id,
+    });
+    apiMocks.issuesList.mockImplementation((_companyId: string, filters?: { parentId?: string }) =>
+      Promise.resolve(filters?.parentId === parent.id ? [hiddenChild] : [parent]),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <Inbox />
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain("Parent with hidden sub-tasks");
+    });
+
+    const parentRow = Array.from(container.querySelectorAll("[data-inbox-item]")).find((row) =>
+      row.textContent?.includes("Parent with hidden sub-tasks"),
+    )!;
+    const chevron = parentRow.querySelector<HTMLButtonElement>('button[data-slot="icon-button"]');
+    expect(chevron).not.toBeNull();
+    // The count badge and the chevron now coexist — that pairing is the fix.
+    expect(parentRow.textContent).toContain("2 live below");
+    // Nothing is loaded yet, so the row must not claim a zero sub-task count.
+    expect(parentRow.textContent).not.toContain("(0 sub-task");
+
+    await act(async () => {
+      chevron!.click();
+    });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain("Sub-task fetched on expand");
+    });
+
+    root.unmount();
+  });
+
   it("paints row hover via CSS only, without moving React selection state", async () => {
     routerMock.location.pathname = "/inbox/mine";
     const issueA = createIssue({ id: "issue-a", identifier: "PAP-1001", title: "First inbox row" });

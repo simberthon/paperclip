@@ -222,7 +222,9 @@ export function useInboxBadge(companyId: string | null | undefined) {
   });
   usePublishSharedQueryData(sharedDashboard, dashboard, dashboardUpdatedAt);
 
-  const mineIssuesQueryKey = queryKeys.issues.listMineByMe(companyId!);
+  // Same scope as the Inbox list (LUN-4376) so the badge count and the rows the
+  // user actually sees after clicking it never disagree.
+  const mineIssuesQueryKey = [...queryKeys.issues.listMineByMe(companyId!), "subtree"] as const;
   const sharedMineIssues = useSharedPollingQuery({
     companyId,
     resourceKey: "inbox-badge:mine-issues",
@@ -234,9 +236,12 @@ export function useInboxBadge(companyId: string | null | undefined) {
     queryFn: () =>
       issuesApi.list(companyId!, {
         touchedByUserId: "me",
+        touchedByUserScope: "subtree",
         inboxArchivedByUserId: "me",
         status: INBOX_ISSUE_STATUSES,
         limit: INBOX_BADGE_ISSUE_LIMIT,
+        sortField: "updated",
+        sortDir: "desc",
       }),
     enabled: !!companyId,
     refetchOnWindowFocus: false,

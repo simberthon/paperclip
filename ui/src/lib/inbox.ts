@@ -729,8 +729,50 @@ export function sortIssuesByMostRecentActivity(a: Issue, b: Issue): number {
   return normalizeTimestamp(b.updatedAt) - normalizeTimestamp(a.updatedAt);
 }
 
+export type RecentTouchedIssuesResult = {
+  issues: Issue[];
+  /** How many rows were available before the cap. */
+  totalCount: number;
+  /** True when `totalCount` exceeded the cap and rows were dropped. */
+  truncated: boolean;
+};
+
+/**
+ * Caps the inbox at `RECENT_ISSUES_LIMIT` rows by most recent activity, then
+ * pulls back any parent of a surviving row that the cap had cut.
+ *
+ * Without that second pass a sub-task can outrank its parent, survive the cap
+ * alone, and render as an orphan root — `buildInboxNesting` only nests a child
+ * whose parent is in the same list. Re-added parents can push the result a few
+ * rows past the cap; that is deliberate and cheaper than losing the hierarchy.
+ */
+export function getRecentTouchedIssuesWithMeta(issues: Issue[]): RecentTouchedIssuesResult {
+  const sorted = [...issues].sort(sortIssuesByMostRecentActivity);
+  const capped = sorted.slice(0, RECENT_ISSUES_LIMIT);
+  if (sorted.length <= RECENT_ISSUES_LIMIT) {
+    return { issues: capped, totalCount: sorted.length, truncated: false };
+  }
+
+  const byId = new Map(sorted.map((issue) => [issue.id, issue] as const));
+  const included = new Map(capped.map((issue) => [issue.id, issue] as const));
+  for (const issue of capped) {
+    let parentId = issue.parentId;
+    const seen = new Set<string>([issue.id]);
+    while (parentId && !included.has(parentId) && !seen.has(parentId)) {
+      seen.add(parentId);
+      const parent = byId.get(parentId);
+      if (!parent) break;
+      included.set(parent.id, parent);
+      parentId = parent.parentId;
+    }
+  }
+
+  const result = [...included.values()].sort(sortIssuesByMostRecentActivity);
+  return { issues: result, totalCount: sorted.length, truncated: true };
+}
+
 export function getRecentTouchedIssues(issues: Issue[]): Issue[] {
-  return [...issues].sort(sortIssuesByMostRecentActivity).slice(0, RECENT_ISSUES_LIMIT);
+  return getRecentTouchedIssuesWithMeta(issues).issues;
 }
 
 export function getUnreadTouchedIssues(issues: Issue[]): Issue[] {

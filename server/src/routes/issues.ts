@@ -4945,6 +4945,7 @@ export function issueRoutes(
       participantAgentId: req.query.participantAgentId as string | undefined,
       assigneeUserId,
       touchedByUserId,
+      touchedByUserScope: req.query.touchedByUserScope === "subtree" ? "subtree" : undefined,
       inboxArchivedByUserId,
       unreadForUserId,
       projectId: req.query.projectId as string | undefined,

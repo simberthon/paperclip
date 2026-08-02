@@ -1,9 +1,9 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
 import { budgetService } from "./budgets.js";
-import { visibleIssueCondition } from "./issue-visibility.js";
+import { orphanedByClosedParentCondition, visibleIssueCondition } from "./issue-visibility.js";
 
 const DASHBOARD_RUN_ACTIVITY_DAYS = 14;
 
@@ -47,6 +47,26 @@ export function dashboardService(db: Db) {
         .where(and(eq(issues.companyId, companyId), visibleIssueCondition()))
         .groupBy(issues.status);
 
+      // Two ways open work goes silently missing from the board, counted over
+      // the same open set the `open` tile reports: nobody owns it (so no
+      // heartbeat ever picks it up and it shows in no assignee view), or its
+      // parent is already closed (so the tree hides it).
+      const [strandedRow] = await db
+        .select({
+          unassigned: sql<number>`count(*) filter (
+            where ${issues.assigneeAgentId} is null and ${issues.assigneeUserId} is null
+          )`,
+          orphanedByClosedParent: sql<number>`count(*) filter (
+            where ${orphanedByClosedParentCondition()}
+          )`,
+        })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ));
+
       const pendingApprovals = await db
         .select({ count: sql<number>`count(*)` })
         .from(approvals)
@@ -71,6 +91,8 @@ export function dashboardService(db: Db) {
         inProgress: 0,
         blocked: 0,
         done: 0,
+        unassigned: Number(strandedRow?.unassigned ?? 0),
+        orphanedByClosedParent: Number(strandedRow?.orphanedByClosedParent ?? 0),
       };
       for (const row of taskRows) {
         const count = Number(row.count);

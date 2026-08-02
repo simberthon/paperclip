@@ -58,6 +58,8 @@ export type IssueListFilters = {
   originKindPrefix?: string;
   originId?: string;
   descendantOf?: string;
+  /** Only issues whose parent is already done or cancelled. */
+  orphanedByClosedParent?: boolean;
   includeRoutineExecutions?: boolean;
   includeBlockedBy?: boolean;
   includeBlockedInboxAttention?: boolean;
@@ -89,6 +91,7 @@ function issueListSearchParams(filters?: IssueListFilters) {
   if (filters?.originKindPrefix) params.set("originKindPrefix", filters.originKindPrefix);
   if (filters?.originId) params.set("originId", filters.originId);
   if (filters?.descendantOf) params.set("descendantOf", filters.descendantOf);
+  if (filters?.orphanedByClosedParent) params.set("orphanedByClosedParent", "true");
   if (filters?.includeRoutineExecutions) params.set("includeRoutineExecutions", "true");
   if (filters?.includeBlockedBy) params.set("includeBlockedBy", "true");
   if (filters?.includeBlockedInboxAttention) params.set("includeBlockedInboxAttention", "true");

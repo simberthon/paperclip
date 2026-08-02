@@ -19,6 +19,13 @@ import type { Issue } from "@paperclipai/shared";
 const WORKSPACE_FILTER_ISSUE_LIMIT = 1000;
 const ISSUES_PAGE_SIZE = 100;
 
+/**
+ * Statuses that still represent live work. Used by the stranded-work views
+ * below, which are only meaningful over open issues — an unassigned or
+ * closed-parent issue that is itself done is not a problem.
+ */
+const OPEN_ISSUE_STATUSES = "backlog,todo,in_progress,in_review,blocked";
+
 export function getNextIssuesPageOffset(
   loadedPageSize: number,
   currentOffset: number,
@@ -73,6 +80,12 @@ export function Issues() {
     return urlSearch;
   }, [searchOverride, urlSearch, location.search]);
   const participantAgentId = searchParams.get("participantAgentId") ?? undefined;
+  // Stranded-work views, linked from the dashboard tile. Both are resolved
+  // server-side: a client-side filter over the loaded page would silently miss
+  // rows whose parent (or whole cohort) has not been fetched yet.
+  const unassignedOnly = searchParams.get("assigneeAgentId") === "null";
+  const orphanedByClosedParent = searchParams.get("orphanedByClosedParent") === "true";
+  const strandedStatuses = unassignedOnly || orphanedByClosedParent ? OPEN_ISSUE_STATUSES : undefined;
   const initialWorkspaces = searchParams.getAll("workspace").filter((workspaceId) => workspaceId.length > 0);
   const workspaceIdFilter = initialWorkspaces.length === 1 ? initialWorkspaces[0] : undefined;
   const handleSearchChange = useCallback((search: string) => {
@@ -147,6 +160,10 @@ export function Issues() {
       participantAgentId ?? "__all__",
       "workspace",
       workspaceIdFilter ?? "__all__",
+      "unassigned",
+      unassignedOnly,
+      "orphaned-by-closed-parent",
+      orphanedByClosedParent,
       "compact",
       "with-routine-executions",
       "infinite",
@@ -155,6 +172,9 @@ export function Issues() {
     queryFn: ({ pageParam, signal }) => issuesApi.listCompact(selectedCompanyId!, {
       participantAgentId,
       workspaceId: workspaceIdFilter,
+      ...(unassignedOnly ? { assigneeAgentId: "null" } : {}),
+      ...(orphanedByClosedParent ? { orphanedByClosedParent: true } : {}),
+      ...(strandedStatuses ? { status: strandedStatuses } : {}),
       includeRoutineExecutions: true,
       limit: issuePageSize,
       offset: pageParam,

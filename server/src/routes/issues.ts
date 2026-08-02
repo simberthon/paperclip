@@ -415,20 +415,28 @@ const attachmentArtifactMetadataInputSchema = z.object({
 function buildCreateIssueActivityStatusDetails(
   issue: { assigneeAgentId: string | null; status: string },
   res: Response,
+  defaultedToActorAgentId: string | null = null,
 ) {
   const statusDefault = res.locals.createIssueStatusDefault as
     | ReturnType<typeof resolveCreateIssueStatusDefault>
     | undefined;
-  const assignmentWakeSkipped = !issue.assigneeAgentId || issue.status === "backlog";
+  const ownedByCreatorByDefault = defaultedToActorAgentId !== null
+    && defaultedToActorAgentId === issue.assigneeAgentId;
+  const assignmentWakeSkipped = !issue.assigneeAgentId
+    || issue.status === "backlog"
+    || ownedByCreatorByDefault;
   return {
     status: issue.status,
     statusDefaulted: statusDefault?.defaulted ?? false,
     statusDefaultReason: statusDefault?.reason ?? "explicit",
+    assigneeDefaultedToCreator: defaultedToActorAgentId !== null,
     assignmentWakeSkipped,
     assignmentWakeSkipReason: assignmentWakeSkipped
-      ? issue.assigneeAgentId
-        ? "assigned_backlog"
-        : "no_agent_assignee"
+      ? !issue.assigneeAgentId
+        ? "no_agent_assignee"
+        : issue.status === "backlog"
+          ? "assigned_backlog"
+          : "creator_owns_by_default"
       : null,
   };
 }
@@ -4855,6 +4863,7 @@ export function issueRoutes(
     const compactView = view === "compact";
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     const includeLiveDescendantSummary = parseOptionalBooleanQuery(req.query.includeLiveDescendantSummary);
+    const orphanedByClosedParent = parseOptionalBooleanQuery(req.query.orphanedByClosedParent);
     const assigneeAgentFilterRaw = req.query.assigneeAgentId;
     let assigneeAgentId: string | null | undefined;
 
@@ -4906,6 +4915,10 @@ export function issueRoutes(
       res.status(400).json({ error: "includeLiveDescendantSummary must be true or false when provided" });
       return;
     }
+    if (orphanedByClosedParent === null) {
+      res.status(400).json({ error: "orphanedByClosedParent must be true or false when provided" });
+      return;
+    }
     if (assigneeAgentFilterRaw !== undefined) {
       if (typeof assigneeAgentFilterRaw !== "string") {
         res.status(422).json({ error: "assigneeAgentId must be a UUID or 'null'" });
@@ -4938,6 +4951,7 @@ export function issueRoutes(
       workspaceId: req.query.workspaceId as string | undefined,
       executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
       parentId: req.query.parentId as string | undefined,
+      orphanedByClosedParent: orphanedByClosedParent === true,
       descendantOf: req.query.descendantOf as string | undefined,
       labelId: req.query.labelId as string | undefined,
       originKind: req.query.originKind as string | undefined,
@@ -7277,6 +7291,16 @@ export function issueRoutes(
       });
       return;
     }
+    // The service falls issue ownership back to the creator when a create names
+    // no assignee. That agent is already running and already holds the context,
+    // so waking it for this issue would bill a whole extra run to tell it what
+    // it just did.
+    const creatorOwnsByDefault = !rawCreateBody.assigneeAgentId
+      && !rawCreateBody.assigneeUserId
+      && issue.assigneeAgentId !== null
+      && issue.assigneeAgentId === actor.agentId
+      ? actor.agentId
+      : null;
     await issueReferencesSvc.syncIssue(issue.id);
     await externalObjectsSvc.syncIssueSafely(issue.id);
     const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
@@ -7310,7 +7334,7 @@ export function issueRoutes(
             },
           }
           : {}),
-        ...buildCreateIssueActivityStatusDetails(issue, res),
+        ...buildCreateIssueActivityStatusDetails(issue, res, creatorOwnsByDefault),
         ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
         ...summarizeIssueReferenceActivityDetails({
           addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
@@ -7364,15 +7388,20 @@ export function issueRoutes(
       });
     }
 
-    void queueIssueAssignmentWakeup({
-      heartbeat,
-      issue,
-      reason: "issue_assigned",
-      mutation: "create",
-      contextSource: "issue.create",
-      requestedByActorType: actor.actorType,
-      requestedByActorId: actor.actorId,
-    });
+    // A creator that fell back to owning its own issue is, by definition,
+    // already running and already holds the context. Waking it for that issue
+    // would bill a whole extra run to tell it what it just did.
+    if (!creatorOwnsByDefault) {
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue,
+        reason: "issue_assigned",
+        mutation: "create",
+        contextSource: "issue.create",
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+      });
+    }
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
     res.status(201).json({
@@ -7460,6 +7489,14 @@ export function issueRoutes(
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
       watchdogActorRunId: actor.runId,
     });
+    // See issue.create: a creator that only owns this child because nothing
+    // else claimed it must not be woken for work it is already doing.
+    const creatorOwnsByDefault = !sanitizedBody.assigneeAgentId
+      && !sanitizedBody.assigneeUserId
+      && issue.assigneeAgentId !== null
+      && issue.assigneeAgentId === actor.agentId
+      ? actor.agentId
+      : null;
     await externalObjectsSvc.syncIssueSafely(issue.id);
 
     await logActivity(db, {
@@ -7476,7 +7513,7 @@ export function issueRoutes(
         parentId: parent.id,
         identifier: issue.identifier,
         title: issue.title,
-        ...buildCreateIssueActivityStatusDetails(issue, res),
+        ...buildCreateIssueActivityStatusDetails(issue, res, creatorOwnsByDefault),
         inheritedExecutionWorkspaceFromIssueId: parent.id,
         ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
         ...(parentBlockerAdded ? { parentBlockerAdded: true } : {}),
@@ -7535,7 +7572,10 @@ export function issueRoutes(
       });
     }
 
-    if (!serializationContext || !currentSerializedChild) {
+    if (
+      (!serializationContext || !currentSerializedChild)
+      && !creatorOwnsByDefault
+    ) {
       void queueIssueAssignmentWakeup({
         heartbeat,
         issue,
@@ -7602,6 +7642,10 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     const normalizedChildren = [];
+    // Children that named no assignee: the service falls the ownership back to
+    // the creator, which must not then bill a wake per child to the very agent
+    // that is decomposing the plan.
+    const creatorOwnedChildIds = new Set<string>();
     for (const child of requestedChildren) {
       const executionPolicy = applyActorMonitorScheduledBy(
         normalizeIssueExecutionPolicy(child.executionPolicy),
@@ -7615,6 +7659,7 @@ export function issueRoutes(
         projectId: child.projectId ?? sourceIssue.projectId ?? null,
         executionPolicy,
       }, actor);
+      if (!child.assigneeAgentId && !child.assigneeUserId) creatorOwnedChildIds.add(childIssueId);
       normalizedChildren.push({
         ...child,
         id: childIssueId,
@@ -7702,7 +7747,11 @@ export function issueRoutes(
           title: issue.title,
           inheritedExecutionWorkspaceFromIssueId: sourceIssue.id,
           acceptedPlanRevisionId: req.body.acceptedPlanRevisionId,
-          ...buildCreateIssueActivityStatusDetails(issue, res),
+          ...buildCreateIssueActivityStatusDetails(
+            issue,
+            res,
+            creatorOwnedChildIds.has(issue.id) ? actor.agentId : null,
+          ),
           ...(serializationContext
             ? {
               watchdogFollowUpsSerialized: true,
@@ -7739,7 +7788,7 @@ export function issueRoutes(
         });
       }
 
-      if (!serializedBlockedChildIds.has(issue.id)) {
+      if (!serializedBlockedChildIds.has(issue.id) && !creatorOwnedChildIds.has(issue.id)) {
         void queueIssueAssignmentWakeup({
           heartbeat,
           issue,

@@ -141,7 +141,6 @@ import {
   getLatestFailedRunsByAgent,
   matchesInboxIssueSearch,
   getRecentTouchedIssuesWithMeta,
-  RECENT_ISSUES_LIMIT,
   isInboxEntityDismissed,
   isMineInboxTab,
   loadCollapsedInboxGroupKeys,

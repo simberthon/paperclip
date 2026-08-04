@@ -327,6 +327,14 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
+// Wake reasons whose sole trigger is a comment landing on the issue. A deferred
+// wake carrying only these reasons is redundant when every referenced comment was
+// written by the run that is now finishing.
+const COMMENT_ONLY_WAKE_REASONS = new Set(["issue_commented", "issue_reopened_via_comment"]);
+// Set on a coalesced context when a comment wake merged over a wake with a
+// different (non-comment) reason, so the merged row is never treated as
+// comment-only even though `wakeReason` now reads as a comment wake.
+const NON_COMMENT_WAKE_MERGED_KEY = "nonCommentWakeMerged";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
@@ -5178,6 +5186,16 @@ export function mergeCoalescedContextSnapshot(
   };
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
+  }
+  // `{...existing, ...incoming}` lets a later comment wake overwrite an earlier
+  // wake's reason. Remember that a non-comment reason was folded in so the
+  // self-authored-comment suppression below cannot silently drop it.
+  const existingWakeReason = readNonEmptyString(existing.wakeReason);
+  if (
+    existing[NON_COMMENT_WAKE_MERGED_KEY] === true ||
+    (existingWakeReason !== null && !COMMENT_ONLY_WAKE_REASONS.has(existingWakeReason))
+  ) {
+    merged[NON_COMMENT_WAKE_MERGED_KEY] = true;
   }
   const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
@@ -15817,6 +15835,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             deferredComments.length > 0 &&
             deferredComments.every((comment) => comment.createdByRunId === run.id);
         }
+        // PAP/LUN-4107: the route-level wake decision already refuses to wake an
+        // agent with its own comment (routes/issues.ts `selfComment`), but that check
+        // reads `actor.actorType === "agent"` and local-CLI agents comment under user
+        // auth, so their self-comments still queue a wake. When the wake lands while
+        // the authoring run still holds the issue lock it is deferred, and this
+        // promotion path used to hand it back to the same agent the moment its run
+        // ended: a full paid heartbeat whose only news is a comment that agent wrote
+        // itself. Suppress it, but only when the deferred row carries nothing else -
+        // every referenced comment is from this run, the reason is a comment reason,
+        // and no non-comment wake was coalesced in.
+        const deferredWakeIsSelfAuthoredCommentOnly =
+          deferredCommentWakeIsSelfAuthored &&
+          deferredWakeReason !== null &&
+          COMMENT_ONLY_WAKE_REASONS.has(deferredWakeReason) &&
+          deferredContextSeed[NON_COMMENT_WAKE_MERGED_KEY] !== true;
+
+        if (deferredWakeIsSelfAuthoredCommentOnly) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Deferred wake suppressed: comment authored by the run that just finished",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =

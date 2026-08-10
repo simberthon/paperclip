@@ -322,4 +322,107 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     expect(created.originKind).toBe("manual");
     expect(created.originRunId).toBe(runId);
   });
+
+  it("deduplicates a rephrased sibling that carries the same leading work-item code", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+
+    // Verbatim from the LUN-5203 incident: two runs re-planned the same parent and
+    // restated every title, so exact-title dedup matched none of the five pairs.
+    const firstPass = [
+      "ROT-01 — Rotation en lot de TOUS les secrets exposes (8 tickets absorbes)",
+      "SEC-02 — Privileges AWS de l'app prod + cles root (4 tickets absorbes) — lab d'abord",
+      "SEC-02b — Purge des grants IAM excedentaires sur les identites agents (5 tickets absorbes)",
+      "SEC-03 — Fermer les 2 controles qui echouent en mode ouvert (3 tickets absorbes)",
+      "SEC-05 — HTTPS force + HSTS + en-tetes de securite reellement expedies (~1h30)",
+    ];
+    const secondPass = [
+      "ROT-01 — Rotation en lot de tous les secrets exposes (Bangerz prod + lab)",
+      "SEC-02 — Retirer AdministratorAccess a l'app prod + neutraliser les cles root",
+      "SEC-02b — Purge des grants IAM excedentaires sur les identites agents",
+      "SEC-03 — Fermer les 2 controles de securite qui echouent en mode ouvert",
+      "SEC-05 — HTTPS force + HSTS + en-tetes de securite reellement expedies",
+    ];
+
+    const originals: string[] = [];
+    for (const title of firstPass) {
+      const created = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ parentId: parent.id, title })
+        .expect(201);
+      originals.push(created.body.id);
+    }
+    for (const [index, title] of secondPass.entries()) {
+      const replay = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ parentId: parent.id, title })
+        .expect(200);
+      expect(replay.body).toMatchObject({
+        id: originals[index],
+        deduplicated: true,
+        deduplicationReason: "recent_open_sibling_code",
+      });
+    }
+
+    const children = await db.select().from(issues).where(eq(issues.parentId, parent.id));
+    expect(children).toHaveLength(5);
+  });
+
+  it("keeps distinct codes, closed siblings and explicit duplicates out of the code guard", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+
+    const first = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "SEC-05 — HTTPS force" })
+      .expect(201);
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "SEC-06 — HTTPS force elsewhere" })
+      .expect(201);
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "SEC-07 — deliberate second pass", allowDuplicate: true })
+      .expect(201);
+
+    // A closed sibling no longer shadows its code.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, first.body.id));
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "SEC-05 — reopened work" })
+      .expect(201);
+
+    const children = await db.select().from(issues).where(eq(issues.parentId, parent.id));
+    expect(children).toHaveLength(4);
+  });
+
+  it("treats a leading existing issue identifier as a reference, not a work-item code", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+
+    // An issue whose identifier IS the leading token: "ROT-01 — …" then reads as a
+    // reference to that issue, so two siblings citing it stay distinct.
+    await db.insert(issues).values({
+      companyId,
+      title: "Referenced issue",
+      status: "todo",
+      priority: "medium",
+      identifier: "ROT-01",
+    });
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "ROT-01 — write the migration" })
+      .expect(201);
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "ROT-01 — write the tests" })
+      .expect(201);
+
+    const children = await db.select().from(issues).where(eq(issues.parentId, parent.id));
+    expect(children).toHaveLength(2);
+  });
 });

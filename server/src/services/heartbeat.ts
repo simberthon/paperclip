@@ -2465,6 +2465,12 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  /**
+   * Internal (LUN-5210). Set only by enqueueWakeup when it re-enters itself
+   * after reaping a zombie issue-execution lock holder, so a lock that survives
+   * the reap degrades to the old fall-through instead of looping.
+   */
+  internalZombieReapRetry?: boolean;
 }
 
 type UsageTotals = {
@@ -17991,6 +17997,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
             return { kind: "deferred" as const };
           }
+
+          // LUN-5210: getting here means filterZombieCoalesceTarget nulled the
+          // target — the issue's execution lock is held by a run this process
+          // believes is dead. Falling straight through to the fresh-run insert
+          // (the old behaviour) starts a second run while the DB still shows the
+          // first as "running", AND leaves the lock pointing at the zombie:
+          // claimQueuedRun only stamps executionRunId when it is NULL or already
+          // the claiming run, so the stamp silently updates 0 rows and the NEXT
+          // wake repeats the whole sequence. Measured on LUN-3702 (2026-07-26):
+          // three live runs on one issue, wakes 113s and 7s apart; a unit repro
+          // leaks one run per wake without bound.
+          //
+          // Reap the zombie through the normal finalization path instead. That
+          // clears (or transfers, when a process-loss retry is queued) the lock
+          // with full bookkeeping — deferred wakes promoted, leases released —
+          // and the re-entered wake then coalesces or defers against a single
+          // real holder.
+          if (!opts.internalZombieReapRetry) {
+            return { kind: "zombie_lock" as const, zombieRunId: activeExecutionRun.id };
+          }
         }
 
         // PAP-13775: no live run holds the lock, so this wake would start a
@@ -18192,6 +18218,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "queued" as const, run: newRun };
       });
 
+      if (outcome.kind === "zombie_lock") {
+        // Outside the issue FOR UPDATE transaction — reapOrphanedRuns takes the
+        // same lock via releaseIssueExecutionAndPromote.
+        logger.warn(
+          { agentId, issueId, zombieRunId: outcome.zombieRunId },
+          "issue execution lock held by a run with no live execution; reaping before wake",
+        );
+        await reapOrphanedRuns();
+        return enqueueWakeup(agentId, { ...opts, internalZombieReapRetry: true });
+      }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);

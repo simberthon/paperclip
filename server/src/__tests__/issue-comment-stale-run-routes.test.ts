@@ -259,6 +259,41 @@ function makeIssue(status: "backlog" | "todo" | "done" | "blocked" | "cancelled"
   };
 }
 
+// The review participant is the same agent the peer actor authenticates as, so the
+// auto-approval gate's id match succeeds and `!staleRunComment` is provably the only
+// thing separating the two cases below.
+const REVIEW_PARTICIPANT_AGENT_ID = "44444444-4444-4444-8444-444444444444";
+const REVIEW_APPROVAL_BODY = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+const REVIEW_STAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+async function makeReviewStageIssue() {
+  const { normalizeIssueExecutionPolicy } = await import("../services/issue-execution-policy.js");
+  const policy = normalizeIssueExecutionPolicy({
+    stages: [
+      {
+        id: REVIEW_STAGE_ID,
+        type: "review",
+        participants: [{ type: "agent", agentId: REVIEW_PARTICIPANT_AGENT_ID }],
+      },
+    ],
+  });
+  return {
+    ...makeIssue("in_review"),
+    executionPolicy: policy,
+    executionState: {
+      status: "pending",
+      currentStageId: REVIEW_STAGE_ID,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: REVIEW_PARTICIPANT_AGENT_ID },
+      returnAssignee: { type: "agent", agentId: "22222222-2222-4222-8222-222222222222" },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    },
+  };
+}
+
 // Peer (non-assignee) agent actor. Used instead of the assignee so that the
 // pre-existing "self-comment" wake skip can't be confused with the
 // staleRunComment guard under test — with a peer actor, the assignee wake
@@ -657,6 +692,68 @@ describe.sequential("issue comment stale-run routes (LUN-5207)", () => {
       "Close-out with no run row.",
       expect.objectContaining({ agentId: "44444444-4444-4444-8444-444444444444" }),
       expect.objectContaining({ presentation: null }),
+    );
+  });
+
+  // Review-stage auto-approval (Otto, review of PR #2). `shouldAutoApproveReviewComment`
+  // matches on agent/user id only — `actorMatchesExecutionParticipant` never looks at runId —
+  // so without the `!staleRunComment` gate a zombie run of the review participant could still
+  // drive in_review -> done from a comment that renders as a muted system notice. Worse than
+  // the original bug: quiet bubble, real status change. Paired with the live-author counterpart
+  // below sending the identical request, which DOES approve.
+  it("does not auto-approve a review stage from a stale-run APPROVED comment", async () => {
+    const issue = await makeReviewStageIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    stageZombieAuthor();
+    // Stage the same successful update the live-author case uses, so removing the
+    // `!staleRunComment` gate fails this test on `update` being called — not on a
+    // downstream 404 from an unmocked update inside the auto-approval transaction.
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      status: "done",
+    }));
+
+    const res = await request(await installActor(createApp(), peerAgentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: REVIEW_APPROVAL_BODY });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      REVIEW_APPROVAL_BODY,
+      expect.objectContaining({ agentId: REVIEW_PARTICIPANT_AGENT_ID }),
+      expect.objectContaining({
+        presentation: expect.objectContaining({ kind: "system_notice", tone: "warning" }),
+      }),
+    );
+    await drainWakeups();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("still auto-approves a review stage when the approving run is live", async () => {
+    const issue = await makeReviewStageIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    stageLiveAuthor();
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      status: "done",
+    }));
+
+    const res = await request(await installActor(createApp(), peerAgentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: REVIEW_APPROVAL_BODY });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({
+        status: "done",
+        executionState: expect.objectContaining({ lastDecisionOutcome: "approved" }),
+      }),
+      mockTx,
     );
   });
 });

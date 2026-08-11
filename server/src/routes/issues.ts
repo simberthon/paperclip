@@ -4527,7 +4527,8 @@ export function issueRoutes(
   ) {
     const runId = actorRunId?.trim() ?? "";
     const checkoutRunId = issue.checkoutRunId?.trim() ?? "";
-    if (!runId || !checkoutRunId || checkoutRunId === runId || issue.executionRunId === runId) return false;
+    const executionRunId = issue.executionRunId?.trim() ?? "";
+    if (!runId || !checkoutRunId || checkoutRunId === runId || executionRunId === runId) return false;
     try {
       const [authorRun, checkoutRun] = await Promise.all([
         heartbeat.getRun(runId),
@@ -4536,7 +4537,7 @@ export function issueRoutes(
       return isStaleRunIssueComment({
         actorRunId: runId,
         checkoutRunId,
-        executionRunId: issue.executionRunId,
+        executionRunId: executionRunId || null,
         authorRunStatus: authorRun?.status ?? null,
         checkoutRunStatus: checkoutRun?.status ?? null,
       });
@@ -11048,6 +11049,9 @@ export function issueRoutes(
     // is a run's main liveness path — but it loses its authority: quiet
     // system-notice rendering, no status steering, no wake.
     const staleRunComment = await resolveStaleRunComment(issue, actor.runId ?? null);
+    // Deliberate: the stale-run notice wins over a recovery-notice presentation. Both are
+    // system notices; "this run is no longer the current voice on the issue" is the fact the
+    // reader needs first, and a recovery notice from a dead run would misread as live.
     const commentPresentation = req.body.presentation ??
       (staleRunComment
         ? STALE_RUN_COMMENT_PRESENTATION
@@ -11226,7 +11230,13 @@ export function issueRoutes(
 
     const currentExecutionState = parseIssueExecutionState(currentIssue.executionState);
     const currentExecutionPolicy = normalizeIssueExecutionPolicy(currentIssue.executionPolicy ?? null);
+    // A stale-run comment is de-emphasised in the UI and cannot drive status (see
+    // effectiveReopenRequested/effectiveResumeRequested above). The review-stage auto-approval
+    // path matches on agent/user id only, never on runId, so without this guard a zombie run of a
+    // review participant could still advance in_review -> done from a comment bubble that renders
+    // as a muted system notice.
     const shouldAutoApproveReviewComment =
+      !staleRunComment &&
       currentIssue.status === "in_review" &&
       currentExecutionState?.status === "pending" &&
       actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&

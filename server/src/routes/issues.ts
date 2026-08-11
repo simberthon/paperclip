@@ -183,6 +183,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
+import { isStaleRunIssueComment } from "../services/stale-run-comment.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
@@ -1799,6 +1800,18 @@ function summarizeExecutionParticipants(
 function isClosedIssueStatus(status: string | null | undefined): status is "done" | "cancelled" {
   return status === "done" || status === "cancelled";
 }
+
+// Rendering for a comment written by an already-terminal run while a live
+// successor holds the issue checkout (LUN-5207). Same de-emphasised shape the
+// recovery notices use, so the thread shows it as a quiet trailing note rather
+// than the issue's current voice.
+const STALE_RUN_COMMENT_PRESENTATION: IssueCommentPresentation = {
+  kind: "system_notice",
+  tone: "warning",
+  title: "Stale run — this comment is not the current voice of the issue",
+  detailsDefaultOpen: false,
+  density: "compact",
+};
 
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   issueStatus: string | null | undefined;
@@ -4500,6 +4513,37 @@ export function issueRoutes(
     return value && typeof value === "object" && !Array.isArray(value)
       ? value as Record<string, unknown>
       : {};
+  }
+
+  /**
+   * Resolves `isStaleRunIssueComment` against the live run rows (LUN-5207).
+   * Cheap-gated: only an issue whose checkout is held by a *different* run pays
+   * for the run-status reads. Any lookup failure resolves to `false`, so a
+   * legitimate close-out comment is never demoted by an infrastructure error.
+   */
+  async function resolveStaleRunComment(
+    issue: { checkoutRunId: string | null; executionRunId: string | null },
+    actorRunId: string | null,
+  ) {
+    const runId = actorRunId?.trim() ?? "";
+    const checkoutRunId = issue.checkoutRunId?.trim() ?? "";
+    if (!runId || !checkoutRunId || checkoutRunId === runId || issue.executionRunId === runId) return false;
+    try {
+      const [authorRun, checkoutRun] = await Promise.all([
+        heartbeat.getRun(runId),
+        heartbeat.getRun(checkoutRunId),
+      ]);
+      return isStaleRunIssueComment({
+        actorRunId: runId,
+        checkoutRunId,
+        executionRunId: issue.executionRunId,
+        authorRunStatus: authorRun?.status ?? null,
+        checkoutRunStatus: checkoutRun?.status ?? null,
+      });
+    } catch (err) {
+      logger.warn({ err, runId, checkoutRunId }, "failed to resolve stale-run comment verdict");
+      return false;
+    }
   }
 
   async function deriveRecoveryCommentPresentation(
@@ -10999,8 +11043,15 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
+    // A run the orchestrator already ended, still writing while a live successor
+    // holds the checkout (LUN-5207). The write is accepted — a close-out comment
+    // is a run's main liveness path — but it loses its authority: quiet
+    // system-notice rendering, no status steering, no wake.
+    const staleRunComment = await resolveStaleRunComment(issue, actor.runId ?? null);
     const commentPresentation = req.body.presentation ??
-      await deriveRecoveryCommentPresentation(req, issue.companyId, req.body.body);
+      (staleRunComment
+        ? STALE_RUN_COMMENT_PRESENTATION
+        : await deriveRecoveryCommentPresentation(req, issue.companyId, req.body.body));
     const reopenRequested = req.body.reopen === true;
     const resumeRequested = req.body.resume === true;
     const interruptRequested = req.body.interrupt === true;
@@ -11016,8 +11067,8 @@ export function issueRoutes(
           !resumeRequested &&
           (isIssueMentionGrantDecision(commentAccessDecision) ||
             isDefaultOpenIssueWriteDecision(commentAccessDecision))));
-    const effectiveReopenRequested = crossIssueCommentOnlyGrant ? false : reopenRequested;
-    const effectiveResumeRequested = crossIssueCommentOnlyGrant ? false : resumeRequested;
+    const effectiveReopenRequested = crossIssueCommentOnlyGrant || staleRunComment ? false : reopenRequested;
+    const effectiveResumeRequested = crossIssueCommentOnlyGrant || staleRunComment ? false : resumeRequested;
     if (
       isClosed &&
       req.actor.type === "agent" &&
@@ -11475,7 +11526,9 @@ export function issueRoutes(
       // Re-derive closed-ness from the post-mutation issue so the auto-approval
       // transition (in_review -> done) suppresses a stale `issue_commented` wake
       // to the returnAssignee for an already-completed issue.
-      const skipWake = selfComment || isClosedIssueStatus(currentIssue.status);
+      // A stale run must not queue another heartbeat (LUN-5207 / LUN-4107): its
+      // successor is already awake and working the issue.
+      const skipWake = selfComment || staleRunComment || isClosedIssueStatus(currentIssue.status);
       if (assigneeId && (reopened || !skipWake)) {
         if (reopened) {
           addWakeup(assigneeId, {
@@ -11548,7 +11601,9 @@ export function issueRoutes(
 
       let mentionedIds: string[] = [];
       try {
-        mentionedIds = await svc.findMentionedAgents(issue.companyId, req.body.body);
+        // A stale run's @-mentions carry no authority either — same rule as the
+        // assignee wake above (LUN-5207).
+        mentionedIds = staleRunComment ? [] : await svc.findMentionedAgents(issue.companyId, req.body.body);
       } catch (err) {
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }

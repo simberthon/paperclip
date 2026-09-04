@@ -405,6 +405,26 @@ const INFRA_FAILURE_MAX_CONSECUTIVE_DEFERRALS = 6;
 /** How many recent runs the deferral counter reads when measuring that chain. */
 const INFRA_FAILURE_CHAIN_LOOKBACK_RUNS = 16;
 
+/**
+ * LUN-7056. Which infrastructure reasons may *defer* rather than escalate.
+ *
+ * `escalateStrandedAssignedIssue` is the terminal step, reached only after the retry
+ * ladder is spent. For most infra reasons that ladder did real work — the process was
+ * respawned, the adapter was given another go — and the failure repeating is evidence
+ * worth escalating on. Those keep today's behaviour.
+ *
+ * A provider wall is different in kind. The retries were not spent on the work; they
+ * were spent against a door that stays shut for a known and often long period, and each
+ * one closed instantly. That is what happened on 2026-09-04: the ladder burned through
+ * in seconds against a 50-minute session limit and the issue was declared stranded when
+ * nothing about it was. Only that subset defers.
+ */
+const INFRA_DEFERRABLE_REASONS = new Set<string>([
+  "provider_quota",
+  "transient_upstream",
+  "fleet_paused",
+]);
+
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
@@ -3175,6 +3195,90 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
+   * LUN-7056. Park a `scheduled_retry` run for an issue whose status cannot legally
+   * carry a monitor (`todo`). Mirrors the provider-quota wait run, minus the recovery
+   * action coupling — there is no recovery action here, because nothing is stranded.
+   * Idempotent: an existing future scheduled retry for the same issue is reused.
+   */
+  async function ensureInfraFailureRetryRun(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    agentId: string;
+    retryAt: Date;
+    reason: string;
+  }) {
+    const existing = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, input.issue.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        eq(heartbeatRuns.status, "scheduled_retry"),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+      ))
+      .orderBy(desc(heartbeatRuns.scheduledRetryAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existing) return existing;
+
+    const now = new Date();
+    const retryReason = "infra_failure_recovery";
+    return db.transaction(async (tx) => {
+      const wakeup = await tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: input.issue.companyId,
+          agentId: input.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: retryReason,
+          payload: withRecoveryContext({
+            issueId: input.issue.id,
+            retryOfRunId: input.latestRun?.id ?? null,
+            retryReason,
+            infraFailureReason: input.reason,
+          }, "normal_model"),
+          status: "queued",
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          idempotencyKey: `${retryReason}:${input.issue.id}:${input.retryAt.toISOString()}`,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+      const scheduledRun = await tx
+        .insert(heartbeatRuns)
+        .values({
+          companyId: input.issue.companyId,
+          agentId: input.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "scheduled_retry",
+          wakeupRequestId: wakeup.id,
+          retryOfRunId: input.latestRun?.id ?? null,
+          scheduledRetryAt: input.retryAt,
+          scheduledRetryAttempt: 1,
+          scheduledRetryReason: retryReason,
+          contextSnapshot: withRecoveryContext({
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            wakeReason: retryReason,
+            retryReason,
+            infraFailureReason: input.reason,
+          }, "normal_model"),
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+      await tx
+        .update(agentWakeupRequests)
+        .set({ runId: scheduledRun.id, updatedAt: now })
+        .where(eq(agentWakeupRequests.id, wakeup.id));
+      return scheduledRun;
+    });
+  }
+
+  /**
    * LUN-7056. Absorb an infrastructure run failure without touching the issue status.
    *
    * The issue keeps `todo` / `in_progress` / `in_review` and gets a monitor armed at the
@@ -3192,27 +3296,49 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (issue.status !== "todo" && issue.status !== "in_progress" && issue.status !== "in_review") {
       return null;
     }
+    // A monitor is only legal on an agent-assigned `in_progress`/`in_review` issue
+    // (issueAllowsMonitor). Deferring one of those without an assignee, or deferring a
+    // `todo`, needs the scheduled-retry wake instead.
+    const agentId = issue.assigneeAgentId;
+    if (!agentId || issue.assigneeUserId) return null;
     const retryAfterMs = classification.retryAfterMs;
     if (!retryAfterMs || retryAfterMs <= 0) return null;
 
     const consecutive = await countConsecutiveInfraFailures(issue);
-    if (consecutive > INFRA_FAILURE_MAX_CONSECUTIVE_DEFERRALS) return null;
+    if (consecutive >= INFRA_FAILURE_MAX_CONSECUTIVE_DEFERRALS) return null;
 
     const now = new Date();
     const nextCheckAt = new Date(now.getTime() + retryAfterMs);
+    const monitorAllowed = issue.status === "in_progress" || issue.status === "in_review";
     const previousPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
     const existingNextCheckAt = issue.monitorNextCheckAt ? new Date(issue.monitorNextCheckAt) : null;
     // An assignee-scheduled monitor that already fires sooner is a live wake path;
     // do not overwrite it (and do not lose its notes) just to arm our own.
     const keepExistingMonitor = Boolean(
+      monitorAllowed &&
       existingNextCheckAt &&
       !Number.isNaN(existingNextCheckAt.getTime()) &&
       existingNextCheckAt.getTime() > now.getTime() &&
       existingNextCheckAt.getTime() <= nextCheckAt.getTime(),
     );
 
+    let scheduledRetryRunId: string | null = null;
     let updated: Awaited<ReturnType<typeof issuesSvc.getById>> = null;
-    if (keepExistingMonitor) {
+    if (!monitorAllowed) {
+      // `todo`: keep the status untouched and park a scheduled retry run instead. The
+      // wake is then visible on the issue's live runs rather than in monitorNextCheckAt.
+      const scheduled = await ensureInfraFailureRetryRun({
+        issue,
+        latestRun: input.latestRun,
+        agentId,
+        retryAt: nextCheckAt,
+        reason: classification.reason,
+      });
+      if (!scheduled) return null;
+      scheduledRetryRunId = scheduled.id;
+      updated = await issuesSvc.getById(issue.id);
+      if (!updated) return null;
+    } else if (keepExistingMonitor) {
       updated = await issuesSvc.getById(issue.id);
       if (!updated) return null;
     } else {
@@ -3253,7 +3379,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       actorType: "system",
       actorId: "recovery",
       agentId: null,
-      runId: input.latestRun?.id ?? null,
+      // The run id travels in `details`, not in the FK column: callers reach this path
+      // with a run projection that is not always a persisted heartbeat_runs row.
+      runId: null,
       action: "issue.infra_failure_deferred",
       entityType: "issue",
       entityId: issue.id,
@@ -3269,10 +3397,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         maxConsecutiveInfraFailures: INFRA_FAILURE_MAX_CONSECUTIVE_DEFERRALS,
         latestRunId: input.latestRun?.id ?? null,
         latestRunErrorCode: input.latestRun?.errorCode ?? null,
-        monitorNextCheckAt: keepExistingMonitor
+        wakeKind: monitorAllowed ? "monitor" : "scheduled_retry",
+        wakeAt: keepExistingMonitor
           ? (existingNextCheckAt?.toISOString() ?? null)
           : nextCheckAt.toISOString(),
         monitorReused: keepExistingMonitor,
+        scheduledRetryRunId,
       },
     });
 
@@ -3304,7 +3434,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // a reviewer that cannot be invoked) are business failures and skip this path.
     if (!input.recoveryCause) {
       const failureClass = classifyRunFailureClass(input.latestRun);
-      if (failureClass.failureClass === "infra") {
+      if (failureClass.failureClass === "infra" && INFRA_DEFERRABLE_REASONS.has(failureClass.reason)) {
         const deferred = await deferInfraRunFailure({
           issue: input.issue,
           latestRun: input.latestRun,

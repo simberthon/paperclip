@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -201,12 +201,14 @@ describeEmbeddedPostgres("LUN-7056 infrastructure failures preserve issue status
       companyId,
       entityType: "issue",
       entityId: issue.id,
-      runId: latestRun.id,
     });
+    // The run travels in `details`, not the FK column — callers reach this path with a
+    // run projection that is not always a persisted heartbeat_runs row.
     expect(deferrals[0]?.details).toMatchObject({
       preservedStatus: "in_progress",
       failureClass: "infra",
       failureReason: "provider_quota",
+      latestRunId: latestRun.id,
     });
 
     // The deferral is not an escalation: no blocked write, no recovery action.
@@ -217,7 +219,11 @@ describeEmbeddedPostgres("LUN-7056 infrastructure failures preserve issue status
     expect(actions).toHaveLength(0);
   });
 
-  it("preserves todo, which the pre-LUN-7056 provider-quota monitor path bailed on", async () => {
+  // A monitor is only legal on an agent-assigned `in_progress`/`in_review` issue
+  // (`issueAllowsMonitor`), so on `todo` the deferral parks a `scheduled_retry` run
+  // instead. Either vehicle satisfies the acceptance criterion — the point is that the
+  // status survives and something is armed to come back.
+  it("preserves todo and arms a scheduled retry, where a monitor would be illegal", async () => {
     const { companyId, coderId, issue } = await seedCompany("todo");
     const latestRun = await seedFailedRun({
       companyId,
@@ -238,13 +244,62 @@ describeEmbeddedPostgres("LUN-7056 infrastructure failures preserve issue status
 
     const row = await readIssue(issue.id);
     expect(row.status).toBe("todo");
-    expect(row.monitorNextCheckAt).toBeInstanceOf(Date);
-    expect(new Date(row.monitorNextCheckAt!).getTime()).toBeGreaterThan(before);
+
+    const scheduled = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.status, "scheduled_retry"),
+      ));
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.scheduledRetryReason).toBe("infra_failure_recovery");
+    expect(scheduled[0]?.scheduledRetryAt).toBeInstanceOf(Date);
+    expect(new Date(scheduled[0]!.scheduledRetryAt!).getTime()).toBeGreaterThan(before);
 
     const deferrals = (await readDeferralActivity(issue.id))
       .filter((entry) => entry.action === "issue.infra_failure_deferred");
     expect(deferrals).toHaveLength(1);
-    expect(deferrals[0]?.details).toMatchObject({ preservedStatus: "todo" });
+    expect(deferrals[0]?.details).toMatchObject({
+      preservedStatus: "todo",
+      wakeKind: "scheduled_retry",
+      scheduledRetryRunId: scheduled[0]?.id,
+    });
+  });
+
+  // `escalateStrandedAssignedIssue` is the terminal step, reached only once the retry
+  // ladder is spent. For a lost process those retries did real work and the repeat is
+  // worth escalating on, so only the provider-wall reasons defer. Pinning that here
+  // stops the allowlist being widened back to "any infra failure" by accident.
+  it("still escalates a lost process, even though the class is infra", async () => {
+    const { companyId, coderId, issue } = await seedCompany("in_progress");
+    const latestRun = await seedFailedRun({
+      companyId,
+      agentId: coderId,
+      issueId: issue.id,
+      errorCode: "process_lost",
+      error: "the adapter process exited without reporting a disposition",
+      createdAt: new Date(),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue,
+      previousStatus: "in_progress",
+      latestRun,
+    });
+
+    const row = await readIssue(issue.id);
+    expect(row.status).toBe("blocked");
+    expect(row.unblockDescriptor).not.toBeNull();
+    const deferrals = (await readDeferralActivity(issue.id))
+      .filter((entry) => entry.action === "issue.infra_failure_deferred");
+    expect(deferrals).toHaveLength(0);
   });
 
   it("still escalates a business failure to blocked, with a non-inert unblock path", async () => {

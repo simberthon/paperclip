@@ -28,6 +28,11 @@ import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import {
+  classifyRunFailureClass,
+  type RunFailureClassification,
+} from "./run-failure-class.js";
+import { resolveUnblockDescriptorForBlockedTransition } from "./blocked-unblock-path.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
@@ -388,6 +393,17 @@ const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
+
+/**
+ * LUN-7056. How many consecutive infrastructure-classified run failures an issue may
+ * absorb before the platform stops deferring and escalates it like any other stranded
+ * issue. An infra failure delays work rather than blocking it, so deferring is the
+ * right default — but a chain this long is a platform outage, not a blip, and a human
+ * should see it. The escalation that follows still carries an unblock descriptor.
+ */
+const INFRA_FAILURE_MAX_CONSECUTIVE_DEFERRALS = 6;
+/** How many recent runs the deferral counter reads when measuring that chain. */
+const INFRA_FAILURE_CHAIN_LOOKBACK_RUNS = 16;
 
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
@@ -2238,7 +2254,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+    // LUN-7056: a recovery issue that blocks in place still needs a named way out.
+    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const unblockDescriptor = resolveUnblockDescriptorForBlockedTransition({
+      blockerIssueIds: blockerIds,
+      ownerAgentId: input.issue.assigneeAgentId,
+      cause: "recovery_issue_failed",
+    });
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+      ...(unblockDescriptor ? { unblockDescriptor } : {}),
+    });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -2936,8 +2962,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         eq(issueRecoveryActions.companyId, input.issue.companyId),
       ));
 
+    // LUN-7056: this escalation is board-owned and has no blocker relation, so without a
+    // descriptor it would land in the inert `blocked` state.
+    const dispositionBlockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const dispositionUnblockDescriptor = resolveUnblockDescriptorForBlockedTransition({
+      blockerIssueIds: dispositionBlockerIds,
+      ownerAgentId: null,
+      recoveryActionId: action.id,
+      cause: `disposition_repair:${input.terminalReason}`,
+    });
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      ...(dispositionUnblockDescriptor ? { unblockDescriptor: dispositionUnblockDescriptor } : {}),
     });
     if (!updated) return null;
     const sourceAssigneePreserved =
@@ -3106,6 +3142,143 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return scheduled ? "queued" : "skipped";
   }
 
+  /**
+   * LUN-7056. Count the trailing chain of consecutive infrastructure-classified failed
+   * runs on an issue. A chain of one is the normal case (a quota wall hit once); a long
+   * chain means the platform has been deferring the same issue over and over and should
+   * stop pretending it is only delayed.
+   */
+  async function countConsecutiveInfraFailures(issue: typeof issues.$inferSelect) {
+    const recent = await db
+      .select({
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, issue.companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+        inArray(heartbeatRuns.status, ["failed", "cancelled", "succeeded"]),
+      ))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(INFRA_FAILURE_CHAIN_LOOKBACK_RUNS);
+
+    let consecutive = 0;
+    for (const run of recent) {
+      if (run.status === "succeeded") break;
+      if (classifyRunFailureClass(run).failureClass !== "infra") break;
+      consecutive += 1;
+    }
+    return consecutive;
+  }
+
+  /**
+   * LUN-7056. Absorb an infrastructure run failure without touching the issue status.
+   *
+   * The issue keeps `todo` / `in_progress` / `in_review` and gets a monitor armed at the
+   * classification's backoff, so the platform comes back to it on its own. Returns the
+   * updated issue when the deferral took, and `null` when the caller should fall through
+   * to the normal stranded escalation.
+   */
+  async function deferInfraRunFailure(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    classification: RunFailureClassification;
+    recoveryCause: StrandedRecoveryCause;
+  }) {
+    const { issue, classification } = input;
+    if (issue.status !== "todo" && issue.status !== "in_progress" && issue.status !== "in_review") {
+      return null;
+    }
+    const retryAfterMs = classification.retryAfterMs;
+    if (!retryAfterMs || retryAfterMs <= 0) return null;
+
+    const consecutive = await countConsecutiveInfraFailures(issue);
+    if (consecutive > INFRA_FAILURE_MAX_CONSECUTIVE_DEFERRALS) return null;
+
+    const now = new Date();
+    const nextCheckAt = new Date(now.getTime() + retryAfterMs);
+    const previousPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+    const existingNextCheckAt = issue.monitorNextCheckAt ? new Date(issue.monitorNextCheckAt) : null;
+    // An assignee-scheduled monitor that already fires sooner is a live wake path;
+    // do not overwrite it (and do not lose its notes) just to arm our own.
+    const keepExistingMonitor = Boolean(
+      existingNextCheckAt &&
+      !Number.isNaN(existingNextCheckAt.getTime()) &&
+      existingNextCheckAt.getTime() > now.getTime() &&
+      existingNextCheckAt.getTime() <= nextCheckAt.getTime(),
+    );
+
+    let updated: Awaited<ReturnType<typeof issuesSvc.getById>> = null;
+    if (keepExistingMonitor) {
+      updated = await issuesSvc.getById(issue.id);
+      if (!updated) return null;
+    } else {
+      const policy = {
+        ...(previousPolicy ?? { mode: "normal" as const, commentRequired: true, stages: [] }),
+        monitor: {
+          nextCheckAt: nextCheckAt.toISOString(),
+          notes:
+            `Infrastructure failure (\`${classification.reason}\`) — the work is delayed, not blocked. ` +
+            "Status preserved; the assignee is woken again at the next check.",
+          scheduledBy: "assignee" as const,
+          kind: "external_service" as const,
+          serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+          externalRef: input.latestRun?.id ?? null,
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: "wake_owner" as const,
+        },
+      };
+      const transition = applyIssueMonitorPolicyTransition({
+        issue,
+        policy,
+        previousPolicy,
+        requestedStatus: issue.status,
+        requestedAssigneePatch: {},
+        actor: { agentId: null, userId: null },
+        monitorExplicitlyUpdated: true,
+      });
+      updated = await issuesSvc.update(issue.id, {
+        ...transition.patch,
+        executionPolicy: policy,
+      });
+      if (!updated) return null;
+    }
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: "system",
+      actorId: "recovery",
+      agentId: null,
+      runId: input.latestRun?.id ?? null,
+      action: "issue.infra_failure_deferred",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        identifier: issue.identifier,
+        source: "recovery.infra_failure_preserves_status",
+        preservedStatus: issue.status,
+        failureClass: classification.failureClass,
+        failureReason: classification.reason,
+        failureEvidence: classification.evidence,
+        recoveryCause: input.recoveryCause,
+        consecutiveInfraFailures: consecutive,
+        maxConsecutiveInfraFailures: INFRA_FAILURE_MAX_CONSECUTIVE_DEFERRALS,
+        latestRunId: input.latestRun?.id ?? null,
+        latestRunErrorCode: input.latestRun?.errorCode ?? null,
+        monitorNextCheckAt: keepExistingMonitor
+          ? (existingNextCheckAt?.toISOString() ?? null)
+          : nextCheckAt.toISOString(),
+        monitorReused: keepExistingMonitor,
+      },
+    });
+
+    return updated;
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -3124,6 +3297,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+
+    // LUN-7056: an infrastructure failure delays the work, it does not block it. Keep
+    // the status and re-arm a wake instead of writing a `blocked` the ticket can never
+    // leave. Explicit causes that name a real defect (bad workspace, missing config,
+    // a reviewer that cannot be invoked) are business failures and skip this path.
+    if (!input.recoveryCause) {
+      const failureClass = classifyRunFailureClass(input.latestRun);
+      if (failureClass.failureClass === "infra") {
+        const deferred = await deferInfraRunFailure({
+          issue: input.issue,
+          latestRun: input.latestRun,
+          classification: failureClass,
+          recoveryCause,
+        });
+        if (deferred) return deferred;
+      }
+    }
+
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,
@@ -3143,9 +3334,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    // LUN-7056: never write `blocked` with no blocker and no descriptor — that state has
+    // no unblock event and nothing wakes it.
+    const unblockDescriptor = resolveUnblockDescriptorForBlockedTransition({
+      blockerIssueIds: blockerIds,
+      ownerAgentId: recoveryAction.ownerAgentId ?? recoveryAction.returnOwnerAgentId ?? null,
+      recoveryActionId: recoveryAction.id,
+      cause: recoveryCause,
+    });
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
+      ...(unblockDescriptor ? { unblockDescriptor } : {}),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;

@@ -23971,6 +23971,19 @@ export function heartbeatService(
               .update(issues)
               .set({
                 status: "blocked",
+                // LUN-7056: this write bypasses issuesSvc.update, so it has to do the
+                // blocked bookkeeping itself. Without a descriptor the issue lands with
+                // `blockedBy: []` and `unblockDescriptor: null` — a state no unblock
+                // event can ever leave.
+                blockedTransitionAt: now,
+                blockedOwnerNotifiedAt: null,
+                unblockDescriptor: {
+                  owner: "board",
+                  action:
+                    `\`${WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE}\`: ` +
+                    `${WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE} ` +
+                    WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+                },
                 checkoutRunId: null,
                 executionRunId: null,
                 executionAgentNameKey: null,
